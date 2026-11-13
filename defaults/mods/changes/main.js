@@ -1,4 +1,4 @@
-import { View, div, svg } from "gpui-kit";
+import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, agents, exec, readTextFile, watchFolder, theme, settings, shared, setShared } from "herdr";
 
@@ -649,6 +649,10 @@ export default class Changes extends View {
     // The runtime ignores toLocaleTimeString's options (it adds seconds): hours and minutes by hand.
     const at = session?.at ? new Date(session.at) : null;
     const since = at ? `${at.getHours()}:${String(at.getMinutes()).padStart(2, "0")}` : null;
+    const fpane = (() => { const f = focused(); return f?.pane ? panes().find((p) => p.pane === f.pane) : null; })();
+    const prog = fpane?.program, repo = this.root?.split("/").pop();
+    const followIcon = prog?.icon ? (prog.tint ? svg(prog.icon).size(12).flex_none().text_color(t.muted) : image(prog.icon).size(12).flex_none()) : null;
+    const following = repo ? [prog?.name || (fpane?.terminal ? "Terminal" : null), repo, session?.root ? `since ${since}${session.live ? "" : " (ended)"}` : null].filter(Boolean).join(" · ") : null;
     const staged = this.group("staged").length + this.group("outside").length, total = this.groups.reduce((n, g) => n + g.items.length, 0);
     const canCommit = Boolean(this.message.trim() && staged && this.root && !this.busy && !this.loading);
     const rows = [];
@@ -671,10 +675,12 @@ export default class Changes extends View {
         .child(div().flex_1())
         .child(this.iconButton("view", this.tree ? "list-flat" : "list-tree", (cx) => this.toggleTree(cx), t))
         .child(this.iconButton("refresh", "refresh", (cx) => this.refresh(cx), t)))
-      .when(Boolean(session?.root), (el) => el.child(h_flex().h(22).flex_none().px(14).gap(8).items_center().text_size(11).text_color(t.dim)
-        .child(div().flex_1().min_w(0).truncate().child(`Since ${since}${session.live ? "" : " · session ended"} · ${session.address}`))
-        .child(div().id("session-restart").px(6).rounded(4).cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
-          .on_click((_e, cx) => this.restart(cx)).child("Start over"))))
+      // Which pane the panel follows: with several terminals or agents in a tab, the focused one.
+      .when(Boolean(following), (el) => el.child(h_flex().h(22).flex_none().px(14).gap(6).items_center().text_size(11).text_color(t.dim)
+        .when(Boolean(followIcon), (e) => e.child(followIcon))
+        .child(div().flex_1().min_w(0).truncate().child(following))
+        .when(Boolean(session?.root), (e) => e.child(div().id("session-restart").px(6).rounded(4).cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_click((_e, cx) => this.restart(cx)).child("Start over")))))
       .child(h_flex().id("commit-message").mx(10).mt(4).h(32).flex_none().pl(10).pr(4).gap(4).items_center().rounded(6).border_1().border_color(this.typing ? t.accent : t.border).cursor_text()
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .child(div().flex_1().min_w(0).h_full().flex().items_center().child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
