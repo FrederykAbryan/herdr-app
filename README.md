@@ -1,3 +1,58 @@
+# Herdr — FrederykAbryan's fork
+
+> [!IMPORTANT]
+> **This is a personal fork of [herdrdev/herdr-app](https://github.com/herdrdev/herdr-app)**, the Herdr desktop app by the Herdr team.
+> It is not an official Herdr release, and it is not affiliated with or endorsed by the Herdr maintainers.
+> All credit for Herdr itself goes to them. Report problems with Herdr upstream, and problems with this fork's panels here.
+>
+> Upstream accepts only fixes for its shipped panels ([CONTRIBUTING.md](CONTRIBUTING.md)), so these features live here as personal mods instead of a pull request.
+
+This fork changes only the JavaScript panels (mods) in `defaults/mods/`. The app itself (`src/`, `crates/`) is untouched, so the panels install into a regular released Herdr without building anything.
+
+## What this fork adds
+
+**Changes panel — focus on what the agent did** (`defaults/mods/changes`)
+- **Session focus.** When an agent starts, the panel snapshots its repo's working tree. **Session** mode then shows only what that agent changed and leaves out changes that were already there before it started, even inside the same file. **All** shows everything, as before. Snapshots go through a scratch git index in `/tmp`, so the repo's own index, HEAD and branches are never touched.
+- **Staging like VS Code's Source Control.** It has **Staged Changes**, **Changes**, **Staged outside this session** and **Committed by this session** groups. Hover a file, folder or group to get **+** (stage) or **−** (unstage), and **Commit** commits exactly what's staged.
+- **Tree or list view** with folder, chevron and file icons, and git letters (U, M, A, D, C).
+- **✨ Generate** writes a one-line commit message from the staged diff in the style of the repo's recent commits, using Claude Code in print mode (`claude-auto` or `claude`, haiku model, no tools).
+- **Readable diffs**: syntax colors, indent guides, strong added/removed backgrounds, and the exact changed words highlighted.
+- **Follows the focused pane.** A line shows which terminal or agent it's tracking, e.g. `Claude Code · be-erp · since 10:14`.
+
+**Agents sidebar — your own view** (`defaults/mods/agents`)
+- A View menu with **Group by** status, space, tab, agent or none; **Sort by** most urgent, recently changed, name or sidebar order; and **Hide idle agents**.
+
+**Tab bar — grids and full screen** (`defaults/mods/tabs`, new `defaults/mods/pane-grid`)
+- **Grid button.** Split the focused pane into 2 side by side, 2 stacked, 1 + 2 or 2 × 2, with a terminal or any installed agent in each new pane.
+- **Full screen.** Hides the sidebar, side panel and status bar and maximizes the window; click again to restore exactly what was shown.
+
+## Install the panels into Herdr
+
+You need [Herdr](#install) installed and running. Then:
+
+```sh
+git clone https://github.com/FrederykAbryan/herdr-app.git
+cd herdr-app
+git switch feat/changes-session-focus   # the default branch of this fork
+sh scripts/install-fork-mods.sh
+```
+
+The script installs everything as **personal copies**: `changes-focus`, `agents-view`, `tabs-plus` and `pane-grid`, plus a layout `main-focus` that uses them, and switches to that layout. Herdr's own panels and your existing layout stay as they were. **Ctrl+Shift+L** switches layouts, and deleting those folders in `~/.config/herdr-app` removes the fork's panels. App updates never overwrite personal copies, but they also don't bring upstream fixes into them. Re-run the script after pulling this fork.
+
+**Requirements and limits:**
+- Session focus and Generate need `git`, and on remote machines `env`, `cp` and `/tmp` (Linux, macOS, Unix servers; not Windows).
+- Generate needs Claude Code installed and signed in.
+- The syntax highlighter is a small one-line-at-a-time highlighter, not a full parser.
+
+## License and credits
+
+- Herdr is © the Herdr authors and licensed under the [Apache License 2.0](LICENSE); this fork keeps that license. The fork's changes are the files under `defaults/mods/changes`, `defaults/mods/agents`, `defaults/mods/tabs`, `defaults/mods/pane-grid` and `scripts/install-fork-mods.sh`, plus this section of the README.
+- The `scm-*.svg` icons are [Codicons](https://github.com/microsoft/vscode-codicons) by Microsoft, licensed CC BY 4.0. See `CODICONS-LICENSE` in the mod folders.
+
+---
+
+*Upstream README follows, unchanged.*
+
 # Herdr
 
 Herdr is a desktop app for terminals and coding agents. Keep work in spaces, see which agents need you, and leave terminals running when you close the window.
