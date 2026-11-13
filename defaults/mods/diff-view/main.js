@@ -15,12 +15,13 @@ const CONTEXT = 3, ROW = 20, CHAR = 7.6;
 // long to draw each frame, so they go in a virtual list (a screen at a time, no jumping).
 const PLAIN_MAX = 500;
 
-// The terminal palette (Monokai-like syntax, solid diff rows) and how keywords split up.
+// The terminal palette: GitHub's dark syntax colors, made to read on green and red diff rows,
+// on solid rows a little stronger than GitHub's; changed words a step brighter than their row.
 const VIVID = {
-  syntax: { keyword: "#66d9ef", control: "#f92672", literal: "#ae81ff", function: "#a6e22e", type: "#66d9ef", tag: "#f92672",
-    string: "#e6db74", number: "#ae81ff", attr: "#fd971f", bracket: "#f8f8f2", comment: "#8a8a80", punct: "#f8f8f2" },
-  text: "#f8f8f2", add: "#0f4a14", del: "#5a1212", addCur: "#16661d", delCur: "#7d1818",
-  addWord: "#2f9a3a", delWord: "#b42e2e", addSign: "#7ee787", delSign: "#ff8a80", number: "#75756e", changedNumber: "#e8e8e3",
+  syntax: { keyword: "#ff7b72", control: "#ff7b72", literal: "#79c0ff", function: "#d2a8ff", type: "#ffa657", tag: "#7ee787",
+    string: "#a5d6ff", number: "#79c0ff", attr: "#79c0ff", bracket: "#e6edf3", comment: "#8b949e", punct: "#e6edf3" },
+  text: "#e6edf3", add: "#0f3d1c", del: "#4d1418", addCur: "#155226", delCur: "#661b20",
+  addWord: "#1f6f3a", delWord: "#8e2a31", addSign: "#3fb950", delSign: "#f85149", number: "#6e7681", changedNumber: "#c9d1d9",
 };
 const CONTROL = new Set(`if else for while do switch case default break continue return throw try catch finally await yield new delete
   in of instanceof typeof match loop when elif except raise pass with then fi esac done`.split(/\s+/));
