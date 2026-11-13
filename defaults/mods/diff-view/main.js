@@ -181,7 +181,7 @@ export default class DiffView extends View {
     for (let i = 0; i < rows.length;) {
       if (keep[i] || this.expanded.has(i)) {
         if (rows[i].kind === "change" && (i === 0 || rows[i - 1].kind !== "change")) blocks.push(items.length);
-        items.push({ row: rows[i] }); i++; continue;
+        items.push({ row: rows[i], block: rows[i].kind === "change" ? blocks.length - 1 : -1 }); i++; continue;
       }
       let j = i; while (j < rows.length && !keep[j] && !this.expanded.has(j)) j++;
       items.push({ fold: i, count: j - i, end: j }); i = j;
@@ -238,8 +238,8 @@ export default class DiffView extends View {
     const out = [];
     for (const it of this.items ?? []) {
       if (it.fold !== undefined || this.split || it.row.kind === "same") { out.push(it); continue; }
-      if (it.row.l) out.push({ side: "l", row: it.row });
-      if (it.row.r) out.push({ side: "r", row: it.row });
+      if (it.row.l) out.push({ side: "l", row: it.row, block: it.block });
+      if (it.row.r) out.push({ side: "r", row: it.row, block: it.block });
     }
     return out;
   }
@@ -278,12 +278,13 @@ export default class DiffView extends View {
   }
 
   // One side of a row: number, sign, code. kind: "same", "-", "+", or "gap" (nothing on this side).
-  half(cell, kind, width, t) {
+  // cur: this row belongs to the change the counter is on: a stronger tint and an accent edge.
+  half(cell, kind, width, t, cur = false) {
     const color = kind === "+" ? t.ansi2 : kind === "-" ? t.ansi1 : null;
     const el = h_flex().h_full().flex_none().w(width).items_center().overflow_hidden();
-    if (kind === "gap") return el.bg(t.raised + "60");
-    return el.when(Boolean(color), (e) => e.bg(color + "30"))
-      .child(div().w(3).h_full().flex_none().when(Boolean(color), (e) => e.bg(color)))
+    if (kind === "gap") return el.bg(cur ? t.accent + "1c" : t.raised + "60").child(div().w(3).h_full().flex_none().when(cur, (e) => e.bg(t.accent)));
+    return el.when(Boolean(color), (e) => e.bg(color + (cur ? "5c" : "26")))
+      .child(div().w(3).h_full().flex_none().when(Boolean(color), (e) => e.bg(cur ? t.accent : color)))
       .child(div().w(46).h_full().flex_none().pr(8).flex().items_center().justify_end().text_color(color ?? t.dim).child(String(cell.n)))
       .child(div().w(14).flex_none().font_semibold().text_color(color ?? t.dim).child(kind === "+" ? "+" : kind === "-" ? "−" : ""))
       .child(this.code(cell, color, t));
@@ -296,16 +297,16 @@ export default class DiffView extends View {
         .on_click((_e, cx) => this.unfold(it, cx))
         .child(icon("unfold", 14)).child(`${it.count} unchanged line${it.count === 1 ? "" : "s"}`);
     }
-    const { row } = it;
+    const { row } = it, cur = it.block !== undefined && it.block >= 0 && it.block === this.change;
     if (!this.split) {
       if (row.kind === "same") return h_flex().w_full().h(ROW).flex_none().child(this.half(row.r, "same", lw + rw + 1, t));
-      return h_flex().w_full().h(ROW).flex_none().child(this.half(row[it.side], it.side === "l" ? "-" : "+", lw + rw + 1, t));
+      return h_flex().w_full().h(ROW).flex_none().child(this.half(row[it.side], it.side === "l" ? "-" : "+", lw + rw + 1, t, cur));
     }
     const same = row.kind === "same";
     return h_flex().w_full().h(ROW).flex_none()
-      .child(this.half(row.l, same ? "same" : row.l ? "-" : "gap", lw, t))
-      .child(div().w(1).h_full().flex_none().bg(t.border))
-      .child(this.half(row.r, same ? "same" : row.r ? "+" : "gap", rw, t));
+      .child(this.half(row.l, same ? "same" : row.l ? "-" : "gap", lw, t, cur))
+      .child(div().w(1).h_full().flex_none().bg(cur ? t.accent : t.border))
+      .child(this.half(row.r, same ? "same" : row.r ? "+" : "gap", rw, t, cur));
   }
 
   button(id, name, label, click, t, enabled = true) {
@@ -378,7 +379,10 @@ export default class DiffView extends View {
           .when(this.loading && Boolean(this.rows), (e) => e.child(div().text_color(t.dim).child("updating…"))))
         .child(h_flex().flex_none().gap(2).items_center()
           .child(this.button("change-prev", "arrow-up", null, (cx) => this.step(-1, cx), t, n > 0 && at > 0))
-          .child(div().w(104).text_center().whitespace_nowrap().text_color(t.muted).child(n ? `${Math.max(1, at + 1)} of ${n} change${n === 1 ? "" : "s"}` : "no changes"))
+          .child(div().id("change-count").w(104).h(24).flex().items_center().justify_center().rounded(5).whitespace_nowrap()
+            .when(n > 0, (e) => e.cursor_pointer().hover((st) => st.bg(t.hover)))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => { if (!n) return; if (this.full) this.setFull(false, cx); this.change = (at + 1) % n; this.jump(cx); }).text_color(t.muted).child(n ? `${Math.max(1, at + 1)} of ${n} change${n === 1 ? "" : "s"}` : "no changes"))
           .child(this.button("change-next", "arrow-down", null, (cx) => this.step(1, cx), t, n > 0 && at < n - 1)))
         .child(h_flex().p(2).gap(2).rounded(7).border_1().border_color(t.border)
           .child(this.pill("only-changes", "Changes", !this.full, (cx) => this.setFull(false, cx), t))
