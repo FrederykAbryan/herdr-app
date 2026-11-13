@@ -134,6 +134,8 @@ export default class DiffView extends View {
     try { this.split = localStorage.getItem("split") !== "inline"; } catch { this.split = true; }
     try { this.full = localStorage.getItem("full") === "full"; } catch { this.full = false; }
     this.width = 1200; this.change = -1;
+    // Where the line between the sides sits, as a share of the width: dragged, remembered.
+    try { this.ratio = Math.min(0.85, Math.max(0.15, Number(localStorage.getItem("ratio")) || 0.5)); } catch { this.ratio = 0.5; }
     this.load(cx, true);
     cx.timer.every(2500, (cx) => this.load(cx, false));
   }
@@ -185,6 +187,13 @@ export default class DiffView extends View {
       items.push({ fold: i, count: j - i, end: j }); i = j;
     }
     this.items = items; this.blocks = blocks;
+  }
+
+  endDrag(cx) {
+    if (!this.drag) return;
+    this.drag = null;
+    try { localStorage.setItem("ratio", String(this.ratio)); } catch {}
+    cx.notify();
   }
 
   setFull(full, cx) {
@@ -255,8 +264,12 @@ export default class DiffView extends View {
   }
 
   // How far the code can scroll sideways: the longest line past the room one side gives it.
+  sides() {
+    const left = Math.floor((this.width - 1) * this.ratio);
+    return [left, this.width - 1 - left];
+  }
   maxHx() {
-    const side = this.split ? Math.floor((this.width - 1) / 2) : this.width;
+    const side = this.split ? Math.min(...this.sides()) : this.width;
     return Math.max(0, (this.longest ?? 0) * CHAR + 24 - (side - 63));
   }
   scrollX(by, cx) {
@@ -276,7 +289,7 @@ export default class DiffView extends View {
       .child(this.code(cell, color, t));
   }
 
-  line(it, half, t) {
+  line(it, [lw, rw], t) {
     if (it.fold !== undefined) {
       return h_flex().id(`fold-${it.fold}`).w_full().h(ROW).flex_none().px(12).gap(8).items_center().cursor_pointer()
         .bg(t.accent + "14").text_color(t.accent).hover((s) => s.bg(t.accent + "26"))
@@ -285,14 +298,14 @@ export default class DiffView extends View {
     }
     const { row } = it;
     if (!this.split) {
-      if (row.kind === "same") return h_flex().w_full().h(ROW).flex_none().child(this.half(row.r, "same", half * 2, t));
-      return h_flex().w_full().h(ROW).flex_none().child(this.half(row[it.side], it.side === "l" ? "-" : "+", half * 2, t));
+      if (row.kind === "same") return h_flex().w_full().h(ROW).flex_none().child(this.half(row.r, "same", lw + rw + 1, t));
+      return h_flex().w_full().h(ROW).flex_none().child(this.half(row[it.side], it.side === "l" ? "-" : "+", lw + rw + 1, t));
     }
     const same = row.kind === "same";
     return h_flex().w_full().h(ROW).flex_none()
-      .child(this.half(row.l, same ? "same" : row.l ? "-" : "gap", half, t))
+      .child(this.half(row.l, same ? "same" : row.l ? "-" : "gap", lw, t))
       .child(div().w(1).h_full().flex_none().bg(t.border))
-      .child(this.half(row.r, same ? "same" : row.r ? "+" : "gap", half, t));
+      .child(this.half(row.r, same ? "same" : row.r ? "+" : "gap", rw, t));
   }
 
   button(id, name, label, click, t, enabled = true) {
@@ -313,13 +326,21 @@ export default class DiffView extends View {
     const t = theme(), f = this.file();
     if (!f) return div().id("diff-view").size_full().p(20).bg(t.background).text_color(t.dim).child("Nothing to compare");
     const parts = f.path.split("/"), name = parts.pop(), lines = this.lines();
-    const half = Math.floor((this.width - 1) / 2);
+    const widths = this.sides();
     if ((this.hx ?? 0) > this.maxHx()) this.hx = this.maxHx();
     const n = this.blocks?.length ?? 0, at = this.change;
     const empty = this.note ?? (this.rows ? null : "Loading…");
     return v_flex().id("diff-view").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_size_change((size, cx) => { if (Math.abs(size.width - this.width) > 1) { this.width = size.width; cx.notify(); } })
       .on_mouse_down("left", () => this.handle.focus())
+      // Dragging the line between the sides: the press is on the handle, the moves anywhere.
+      .on_mouse_move((e, cx) => {
+        if (!this.drag) return;
+        this.ratio = Math.min(0.85, Math.max(0.15, this.drag.ratio + (e.position.x - this.drag.x) / Math.max(1, this.width)));
+        cx.notify();
+      })
+      .on_mouse_up("left", (_e, cx) => this.endDrag(cx))
+      .on_hover((hovered, cx) => { if (!hovered) this.endDrag(cx); })
       .on_key_down((e, cx) => {
         const k = e.key;
         if (k === "n" || k === "j" || k === "down" && e.modifiers?.alt) this.step(1, cx);
@@ -377,12 +398,21 @@ export default class DiffView extends View {
             })
             .child(div().w_full().h_full().relative()
               .when(!this.full, (e) => e.child(v_flex().id("diff-plain").absolute().inset_0().overflow_y_scroll().track_scroll(this.scroll)
-                .children(lines.map((it) => this.line(it, half, t)))))
+                .children(lines.map((it) => this.line(it, widths, t)))))
               .when(this.full, (e) => e.child(v_virtual_list("diff-rows", lines.length, ROW, (i) => String(i),
-                (range) => lines.slice(range.start, range.end).map((it) => this.line(it, half, t))).size_full()))))
+                (range) => lines.slice(range.start, range.end).map((it) => this.line(it, widths, t))).size_full()))))
+          .when(this.split, (e) => e.child(div().id("divider").absolute().top(0).bottom(0).left(widths[0] - 3).w(7).cursor_col_resize()
+            .flex().justify_center()
+            .on_mouse_down("left", (ev, cx) => {
+              cx.stop_propagation(); this.handle.focus();
+              if (ev.click_count === 2) { this.ratio = 0.5; this.drag = null; try { localStorage.setItem("ratio", "0.5"); } catch {} }
+              else this.drag = { x: ev.position.x, ratio: this.ratio };
+              cx.notify();
+            })
+            .child(div().w(this.drag ? 3 : 1).h_full().bg(this.drag ? t.accent : t.border).hover((st) => st.bg(t.accent)))))
           .when(!this.full, (e) => e.child(Scrollbar.vertical("diff-plain").absolute().inset_0()))
           .when(this.full, (e) => e.child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0()))))
       .child(h_flex().h(24).flex_none().px(12).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
-        .child("n / p  next / previous change").child("[ / ]  previous / next file").child("f  full file").child("s  side by side / inline").child("shift+wheel / ← →  scroll sideways").child("Esc  close"));
+        .child("n / p  next / previous change").child("[ / ]  previous / next file").child("f  full file").child("s  side by side / inline").child("shift+wheel / ← →  scroll sideways").child("drag the middle line to resize").child("Esc  close"));
   }
 }
