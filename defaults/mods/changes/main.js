@@ -212,6 +212,18 @@ function parseNumstat(stdout, stats = {}) {
   return stats;
 }
 
+// The compare view's palette (mods/diff-view keeps the same one): GitHub's dark syntax colors on
+// solid green and red rows, changed words a step brighter than their row.
+const VIVID = {
+  syntax: { keyword: "#ff7b72", control: "#ff7b72", literal: "#79c0ff", function: "#d2a8ff", type: "#ffa657", tag: "#7ee787",
+    string: "#a5d6ff", number: "#79c0ff", attr: "#79c0ff", bracket: "#e6edf3", comment: "#8b949e", punct: "#e6edf3" },
+  text: "#e6edf3", add: "#0f3d1c", del: "#4d1418", addWord: "#1f6f3a", delWord: "#8e2a31",
+  addSign: "#3fb950", delSign: "#f85149", number: "#6e7681", changedNumber: "#c9d1d9", guide: "#ffffff14",
+};
+const CONTROL = new Set(`if else for while do switch case default break continue return throw try catch finally await yield new delete
+  in of instanceof typeof match loop when elif except raise pass with then fi esac done`.split(/\s+/));
+const LITERAL = new Set("true false null undefined this self Self super None True False nil none".split(" "));
+
 const GROUP_TITLE = { staged: "Staged Changes", outside: "Staged outside this session", changes: "Changes", committed: "Committed by this session" };
 
 export default class Changes extends View {
@@ -658,25 +670,30 @@ export default class Changes extends View {
     return row.tokens;
   }
 
+  // The compare view's terminal look (mods/diff-view): solid rows, GitHub's dark syntax colors.
+  // A light appearance keeps the theme's colors.
   diffRow(row, t) {
-    const { kind, number, text } = row;
-    if (kind === "@") return div().w_full().px(12).h(22).flex_none().flex().items_center().truncate().bg(t.accent + "1f").text_color(t.accent).child(text);
-    const color = kind === "+" ? t.ansi2 : kind === "-" ? t.ansi1 : null;
-    const syntax = {
-      keyword: t.ansi12, function: t.ansi11, type: t.ansi14, tag: t.ansi14, string: t.ansi3, number: t.ansi13,
-      attr: t.ansi10, bracket: t.ansi13, comment: t.dim, punct: t.muted,
-    };
+    const { kind, number } = row;
+    if (kind === "@") return div().w_full().px(12).h(22).flex_none().flex().items_center().truncate().bg(t.accent + "1f").text_color(t.accent).child(row.text);
+    const v = settings().dark === false ? {
+      syntax: { keyword: t.ansi12, control: t.ansi12, literal: t.ansi13, function: t.ansi11, type: t.ansi14, tag: t.ansi14, string: t.ansi3,
+        number: t.ansi13, attr: t.ansi10, bracket: t.ansi13, comment: t.dim, punct: t.muted },
+      text: t.foreground, add: t.ansi2 + "30", del: t.ansi1 + "30", addWord: t.ansi2 + "80", delWord: t.ansi1 + "80",
+      addSign: t.ansi2, delSign: t.ansi1, number: t.dim, changedNumber: t.foreground, guide: t.border,
+    } : VIVID;
+    const bg = kind === "+" ? v.add : kind === "-" ? v.del : null, word = kind === "+" ? v.addWord : kind === "-" ? v.delWord : null;
     const tokens = this.codeTokens(row), unit = this.indent ?? 4;
     const body = h_flex().flex_1().min_w(0).overflow_hidden().h_full().items_center()
-      .children(Array.from({ length: row.levels ?? 0 }, () => div().flex_none().h_full().flex().items_center().border_l(1).border_color(t.border).child(" ".repeat(unit))))
-      .children(tokens.map((tk) => div().flex_none().text_color(syntax[tk.kind] ?? t.foreground)
-        .when(tk.kind === "function", (e) => e.font_bold()).when(tk.kind === "comment" || tk.kind === "attr", (e) => e.italic())
-        .when(Boolean(tk.hl && color), (e) => e.rounded(3).bg(color + "80")).child(tk.text)));
-    return h_flex().w_full().h(22).flex_none().items_center().when(Boolean(color), (e) => e.bg(color + "38"))
-      .child(div().w(3).h_full().flex_none().when(Boolean(color), (e) => e.bg(color)))
-      .child(div().w(38).h_full().flex_none().pr(6).flex().items_center().justify_end().text_color(color ?? t.dim)
-        .when(Boolean(color), (e) => e.bg(color + "40")).child(number === undefined ? "" : String(number)))
-      .child(div().w(16).flex_none().flex().justify_center().font_semibold().text_color(color ?? t.dim).child(kind === "+" ? "+" : kind === "-" ? "−" : ""))
+      .children(Array.from({ length: row.levels ?? 0 }, () => div().flex_none().h_full().flex().items_center().border_l(1).border_color(v.guide ?? t.border).child(" ".repeat(unit))))
+      .children(tokens.map((tk) => {
+        const k = tk.kind === "keyword" ? (CONTROL.has(tk.text) ? "control" : LITERAL.has(tk.text) ? "literal" : "keyword") : tk.kind;
+        return div().flex_none().text_color(v.syntax[k] ?? v.text).when(k === "comment" || k === "attr", (e) => e.italic())
+          .when(Boolean(tk.hl && word), (e) => e.bg(word)).child(tk.text);
+      }));
+    return h_flex().w_full().h(22).flex_none().items_center().when(Boolean(bg), (e) => e.bg(bg))
+      .child(div().w(40).h_full().flex_none().pr(4).flex().items_center().justify_end().text_color(bg ? v.changedNumber : v.number)
+        .child(number === undefined ? "" : String(number)))
+      .child(div().w(16).flex_none().text_color(kind === "+" ? v.addSign : kind === "-" ? v.delSign : v.number).child(kind === "+" ? "+" : kind === "-" ? "-" : ""))
       .child(body);
   }
 
@@ -756,6 +773,11 @@ export default class Changes extends View {
           .rounded(6).border_1().border_color(t.border).bg(t.raised).text_color(t.muted).cursor_pointer()
           .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => this.setPreview(false, cx))
           .child(svg("mods/diff-view/close.svg").size(14)))))
+      // With the preview put away the list fills the panel; this bar brings the preview back.
+      .when(!this.preview, (e) => e.child(h_flex().id("preview-show").mx(10).mb(10).mt(6).h(30).flex_none().gap(6).items_center().justify_center()
+        .rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted).cursor_pointer()
+        .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => this.setPreview(true, cx))
+        .child(svg("mods/diff-view/split.svg").size(14)).child("Show diff preview")))
       .when(Boolean(this.note), (e) => e.child(div().px(10).py(8).text_size(11).text_color(t.ansi1).child(this.note)));
   }
 }
