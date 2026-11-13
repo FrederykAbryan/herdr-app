@@ -30,7 +30,8 @@ clone() {
 }
 
 clone changes changes-focus
-sed 's|^const ICONS = "mods/changes";|const ICONS = "mods/changes-focus";|' "$src/changes/main.js" > "$home/mods/changes-focus/main.js"
+sed -e 's|^const ICONS = "mods/changes";|const ICONS = "mods/changes-focus";|' -e 's|^const FT = "mods/files";|const FT = "mods/files-plus";|' "$src/changes/main.js" > "$home/mods/changes-focus/main.js"
+cp "$src/changes/filetypes.js" "$home/mods/changes-focus/"
 cp "$src"/changes/scm-*.svg "$src/changes/CODICONS-LICENSE" "$home/mods/changes-focus/"
 
 clone agents agents-view
@@ -56,8 +57,8 @@ clone spaces spaces-plus
 sed 's|^const MENU = "menu";|const MENU = "menu-plus";|' "$src/spaces/main.js" > "$home/mods/spaces-plus/main.js"
 
 clone files files-plus
-sed 's|mods/files/|mods/files-plus/|g' "$src/files/main.js" > "$home/mods/files-plus/main.js"
-cp "$src"/files/*.svg "$home/mods/files-plus/"
+sed -e 's|mods/files/|mods/files-plus/|g' -e 's|^const FT = "mods/files";|const FT = "mods/files-plus";|' "$src/files/main.js" > "$home/mods/files-plus/main.js"
+cp "$src"/files/*.svg "$src/files/filetypes.js" "$home/mods/files-plus/"
 
 clone menu menu-plus
 sed 's|^const SELF = "menu";|const SELF = "menu-plus";|' "$src/menu/main.js" > "$home/mods/menu-plus/main.js"

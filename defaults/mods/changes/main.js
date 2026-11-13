@@ -1,6 +1,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, agents, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay } from "herdr";
+import { typeIcon, folderIcon } from "./filetypes.js";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -109,15 +110,9 @@ function diffRows(lines) {
 
 // Icons: Codicons (see CODICONS-LICENSE), tinted with the theme.
 const ICONS = "mods/changes";
+// File-type glyphs: the Files panel's ft-*.svg (shared look, see filetypes.js).
+const FT = "mods/files";
 const icon = (name, size = 14) => svg(`${ICONS}/scm-${name}.svg`).size(size).flex_none();
-// One file shape, tinted per type so the list reads like an editor's.
-const EXT_TINT = {
-  md: "ansi4", mdx: "ansi4", txt: "muted", json: "ansi3", js: "ansi3", mjs: "ansi3", cjs: "ansi3", jsx: "ansi6", ts: "ansi4", tsx: "ansi6",
-  html: "ansi1", htm: "ansi1", css: "ansi5", scss: "ansi5", vue: "ansi2", svelte: "ansi1", py: "ansi4", rs: "ansi1", go: "ansi6",
-  dart: "ansi6", java: "ansi1", kt: "ansi5", php: "ansi5", rb: "ansi1", sh: "ansi2", yml: "ansi5", yaml: "ansi5", toml: "ansi3",
-  sql: "ansi3", pdf: "ansi1", svg: "ansi3", png: "ansi5", jpg: "ansi5", jpeg: "ansi5", gif: "ansi5", lock: "dim",
-};
-const fileTint = (path, t) => t[EXT_TINT[path.split(".").pop().toLowerCase()]] ?? t.muted;
 // git's letters as editors show them: U untracked, C conflict.
 const LETTER_TINT = { U: "ansi2", A: "ansi2", M: "blocked", D: "ansi1", C: "ansi5" };
 const CONFLICT = new Set(["DD", "AU", "UD", "UA", "DU", "AA", "UU"]);
@@ -649,7 +644,7 @@ export default class Changes extends View {
     return this.hoverable(h_flex().id(id).h(24).flex_none().pl(20 + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => this.toggle(this.collapsed, key, cx))
       .child(icon(open ? "chevron-down" : "chevron-right", 16).text_color(t.muted))
-      .child(icon(open ? "folder-opened" : "folder", 16).text_color(t.ansi4))
+      .child(folderIcon(FT, open))
       .child(div().flex_1().min_w(0).truncate().child(name))
       .when(Boolean(action), (e) => e.child(action))
       .child(div().size(6).mx(4).flex_none().rounded(3).bg(t.dim)), id);
@@ -666,7 +661,7 @@ export default class Changes extends View {
       .when(this.open === key, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((e, cx) => { if (e.click_count === 2) this.compare(key, cx); else this.pick(key, cx); })
       // In the tree a file lines up under its folder's icon, past the chevron column.
       .when(this.tree, (e) => e.child(div().w(16).flex_none()))
-      .child(icon("file", 16).text_color(fileTint(f.path, t)))
+      .child(typeIcon(FT, name, t))
       .child(h_flex().flex_1().min_w(0).gap(6).items_center()
         .child(div().min_w(0).max_w(240).truncate().text_color(f.status === "D" ? t.dim : t.foreground).child(name))
         .when(!this.tree && parts.length > 0, (e) => e.child(div().min_w(0).truncate().text_size(11).text_color(t.dim).child(parts.join("/")))))
