@@ -207,15 +207,15 @@ export default class DiffView extends View {
     return n;
   }
   jump(cx) {
-    if (this.change < 0 || !this.blocks?.length) return;
+    if (this.full || this.change < 0 || !this.blocks?.length) return;
     // A little room above the change, like an editor's reveal.
-    const at = Math.max(0, this.lineOf(this.blocks[this.change]) - 4);
-    this.scroll.scroll_to_item(Math.min(at + 4, this.lines().length - 1));
-    this.scroll.scroll_to_item(at);
+    this.scroll.scroll_to_item(Math.max(0, this.lineOf(this.blocks[this.change]) - 3));
     cx.notify();
   }
   step(by, cx) {
     if (!this.blocks?.length) return;
+    // Stepping through changes is the Changes view's job: the full file can't be scrolled to one.
+    if (this.full) this.setFull(false, cx);
     this.change = Math.min(this.blocks.length - 1, Math.max(0, (this.change < 0 ? (by > 0 ? -1 : 0) : this.change) + by));
     this.jump(cx);
   }
@@ -353,11 +353,16 @@ export default class DiffView extends View {
       .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12.5)
         .when(Boolean(empty), (e) => e.child(div().p(16).text_color(t.dim).child(empty)))
         .when(!empty, (e) => e
+          // Changes only: a plain list (few rows), so a change can be scrolled to. Full file: a
+          // virtual list, drawn a screen at a time.
           .child(div().id("diff-x").size_full().overflow_x_scrollbar()
-            .child(div().min_w(half * 2 + 1).w_full().h_full()
-              .child(v_virtual_list("diff-rows", lines.length, ROW, (i) => String(i), (range) => lines.slice(range.start, range.end).map((it) => this.line(it, half, t)))
-                .track_scroll(this.scroll).size_full())))
-          .child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0())))
+            .child(div().min_w(half * 2 + 1).w_full().h_full().relative()
+              .when(!this.full, (e) => e.child(v_flex().id("diff-plain").absolute().inset_0().overflow_y_scroll().track_scroll(this.scroll)
+                .children(lines.map((it) => this.line(it, half, t)))))
+              .when(this.full, (e) => e.child(v_virtual_list("diff-rows", lines.length, ROW, (i) => String(i),
+                (range) => lines.slice(range.start, range.end).map((it) => this.line(it, half, t))).size_full()))))
+          .when(!this.full, (e) => e.child(Scrollbar.vertical("diff-plain").absolute().inset_0()))
+          .when(this.full, (e) => e.child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0()))))
       .child(h_flex().h(24).flex_none().px(12).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
         .child("n / p  next / previous change").child("[ / ]  previous / next file").child("f  full file").child("s  side by side / inline").child("Esc  close"));
   }
