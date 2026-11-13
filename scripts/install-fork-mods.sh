@@ -10,7 +10,7 @@
 #   git-graph -> git-graph       commit graph, opened from the Changes panel (new)
 #   workspace-status -> workspace-status-plus   status bar: click the branch to switch / create one
 #   spaces    -> spaces-plus     Spaces sidebar: groups (fold, drag in, right-click to move)
-#   files     -> files-plus      Files panel: colorful previews (.env too), Edit / Save
+#   files     -> files-plus      Files panel: file-type icons, colorful previews (.env too), Edit / Save
 #   menu      -> menu-plus       space menu with Move to group / New group, the group menu
 #
 # and a layout `main-focus` (a clone of `main`) that uses them. Your own layout stays as it
@@ -57,6 +57,7 @@ sed 's|^const MENU = "menu";|const MENU = "menu-plus";|' "$src/spaces/main.js" >
 
 clone files files-plus
 sed 's|mods/files/|mods/files-plus/|g' "$src/files/main.js" > "$home/mods/files-plus/main.js"
+cp "$src"/files/*.svg "$home/mods/files-plus/"
 
 clone menu menu-plus
 sed 's|^const SELF = "menu";|const SELF = "menu-plus";|' "$src/menu/main.js" > "$home/mods/menu-plus/main.js"

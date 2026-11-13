@@ -15,6 +15,56 @@ const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", 
   env: "bash", zsh: "bash", fish: "bash", bashrc: "bash", zshrc: "bash", profile: "bash", ini: "properties", conf: "properties", cfg: "properties",
   yml: "yaml", py: "python", rs: "rust", h: "c", makefile: "make", mk: "make" };
 const MAX_EDIT = 400000;
+
+// File-type icons, VS Code style: a colored letter badge, or a colored glyph (ft-*.svg).
+// { badge, bg, fg } or { glyph, color }; first match wins: whole name, then extension.
+const BADGE = (badge, bg, fg = "#ffffff") => ({ badge, bg, fg }), GLYPH = (glyph, color) => ({ glyph, color });
+const BY_NAME = {
+  "package.json": GLYPH("package", "#e8274b"), "package-lock.json": GLYPH("lock", "#e8274b"), "bun.lock": GLYPH("lock", "#f9f1e1"),
+  "pnpm-lock.yaml": GLYPH("lock", "#f69220"), "yarn.lock": GLYPH("lock", "#2c8ebb"), "cargo.lock": GLYPH("lock", "#dea584"),
+  "composer.lock": GLYPH("lock", "#8892be"), "pubspec.lock": GLYPH("lock", "#40c4ff"), "pubspec.yaml": GLYPH("package", "#40c4ff"),
+  "cargo.toml": GLYPH("package", "#dea584"), "composer.json": GLYPH("package", "#8892be"),
+  "dockerfile": GLYPH("whale", "#2496ed"), "docker-compose.yml": GLYPH("whale", "#2496ed"), "docker-compose.yaml": GLYPH("whale", "#2496ed"),
+  "compose.yml": GLYPH("whale", "#2496ed"), "compose.yaml": GLYPH("whale", "#2496ed"), ".dockerignore": GLYPH("whale", "#5f7a8a"),
+  ".gitignore": GLYPH("git", "#f14e32"), ".gitattributes": GLYPH("git", "#f14e32"), ".gitmodules": GLYPH("git", "#f14e32"), ".gitkeep": GLYPH("git", "#f14e32"),
+  "license": GLYPH("key", "#e5c07b"), "license.md": GLYPH("key", "#e5c07b"), "license.txt": GLYPH("key", "#e5c07b"),
+  "readme.md": GLYPH("info", "#42a5f5"), "readme": GLYPH("info", "#42a5f5"), "makefile": GLYPH("terminal", "#e37933"),
+  "tsconfig.json": BADGE("TS", "#3178c6"), "jsconfig.json": BADGE("JS", "#f0db4f", "#1b1b1b"),
+  ".editorconfig": GLYPH("gear", "#9aa5b1"), ".prettierrc": GLYPH("gear", "#56b3b4"), ".eslintrc": GLYPH("gear", "#8080f2"),
+};
+const BY_EXT = {
+  ts: BADGE("TS", "#3178c6"), mts: BADGE("TS", "#3178c6"), cts: BADGE("TS", "#3178c6"), tsx: GLYPH("atom", "#3178c6"), jsx: GLYPH("atom", "#61dafb"),
+  js: BADGE("JS", "#f0db4f", "#1b1b1b"), mjs: BADGE("JS", "#f0db4f", "#1b1b1b"), cjs: BADGE("JS", "#f0db4f", "#1b1b1b"),
+  json: GLYPH("braces", "#f0c94a"), jsonc: GLYPH("braces", "#f0c94a"), json5: GLYPH("braces", "#f0c94a"),
+  html: GLYPH("code", "#e44d26"), htm: GLYPH("code", "#e44d26"), xml: GLYPH("code", "#f1662a"), vue: BADGE("V", "#41b883"), svelte: BADGE("S", "#ff3e00"), astro: BADGE("A", "#ff5d01"),
+  css: GLYPH("hash", "#42a5f5"), scss: GLYPH("hash", "#f06292"), sass: GLYPH("hash", "#f06292"), less: GLYPH("hash", "#5b7bd5"),
+  md: BADGE("M", "#42a5f5"), mdx: BADGE("MX", "#f9ac00", "#1b1b1b"),
+  py: BADGE("PY", "#3776ab"), rb: BADGE("RB", "#cc342d"), php: BADGE("PHP", "#777bb4"), go: BADGE("GO", "#00add8"), rs: BADGE("RS", "#dea584", "#1b1b1b"),
+  java: BADGE("J", "#e76f00"), kt: BADGE("K", "#7f52ff"), kts: BADGE("K", "#7f52ff"), swift: BADGE("SW", "#f05138"), dart: BADGE("DT", "#0175c2"),
+  c: BADGE("C", "#5c6bc0"), h: BADGE("H", "#7e57c2"), cpp: BADGE("C++", "#00599c"), hpp: BADGE("H", "#7e57c2"), cs: BADGE("C#", "#68217a"),
+  lua: BADGE("LU", "#000080"), r: BADGE("R", "#276dc3"), ex: BADGE("EX", "#6e4a7e"), exs: BADGE("EX", "#6e4a7e"), zig: BADGE("Z", "#f7a41d", "#1b1b1b"),
+  sh: GLYPH("terminal", "#89e051"), bash: GLYPH("terminal", "#89e051"), zsh: GLYPH("terminal", "#89e051"), fish: GLYPH("terminal", "#89e051"),
+  ps1: GLYPH("terminal", "#5391fe"), bat: GLYPH("terminal", "#c1f12e"), cmd: GLYPH("terminal", "#c1f12e"),
+  sql: GLYPH("db", "#e38c00"), prisma: GLYPH("db", "#5a67d8"), graphql: BADGE("GQ", "#e535ab"), gql: BADGE("GQ", "#e535ab"),
+  yml: GLYPH("gear", "#cb6ce6"), yaml: GLYPH("gear", "#cb6ce6"), toml: GLYPH("gear", "#9c4221"), ini: GLYPH("gear", "#9aa5b1"), conf: GLYPH("gear", "#9aa5b1"),
+  cfg: GLYPH("gear", "#9aa5b1"), properties: GLYPH("gear", "#9aa5b1"), env: GLYPH("gear", "#f5d547"), lock: GLYPH("lock", "#9aa5b1"),
+  png: GLYPH("image", "#26a69a"), jpg: GLYPH("image", "#26a69a"), jpeg: GLYPH("image", "#26a69a"), gif: GLYPH("image", "#26a69a"), webp: GLYPH("image", "#26a69a"),
+  bmp: GLYPH("image", "#26a69a"), ico: GLYPH("image", "#f5d547"), svg: GLYPH("image", "#ffb13b"), avif: GLYPH("image", "#26a69a"),
+  pdf: GLYPH("pdf", "#e53935"), txt: GLYPH("text", "#9aa5b1"), log: GLYPH("text", "#8d6e63"), csv: GLYPH("text", "#43a047"),
+  zip: GLYPH("archive", "#afb42b"), gz: GLYPH("archive", "#afb42b"), tar: GLYPH("archive", "#afb42b"), tgz: GLYPH("archive", "#afb42b"), "7z": GLYPH("archive", "#afb42b"), rar: GLYPH("archive", "#afb42b"),
+  pem: GLYPH("key", "#e5c07b"), key: GLYPH("key", "#e5c07b"), crt: GLYPH("key", "#e5c07b"),
+};
+const FOLDER = "#dcb67a";
+function fileType(name) {
+  const lower = name.toLowerCase();
+  if (BY_NAME[lower]) return BY_NAME[lower];
+  if (lower.startsWith(".env") || lower.endsWith(".env")) return BY_EXT.env;
+  if (lower.startsWith("dockerfile")) return BY_NAME.dockerfile;
+  if (lower.startsWith(".eslintrc") || lower.startsWith(".prettierrc")) return BY_NAME[lower.startsWith(".e") ? ".eslintrc" : ".prettierrc"];
+  if (lower.startsWith("readme")) return BY_NAME.readme;
+  const ext = lower.includes(".") ? lower.split(".").pop() : "";
+  return BY_EXT[ext] ?? null;
+}
 // Edit-button icon colors: vivid in dark mode (the theme's ANSI colors are pale there), the theme's in light.
 const tint = (t) => settings().dark === false
   ? { edit: t.accent, save: t.ansi2, done: t.ansi4, discard: t.ansi1, reload: t.ansi3, overwrite: t.ansi9 }
@@ -220,6 +270,17 @@ export default class Files extends View {
       .on_click((_e, cx) => { if (enabled) click(cx); }).child(svg(`mods/diff-view/${name}.svg`).size(15));
   }
 
+  // A row's icon: a folder (open or shut), a file type's badge or glyph, else a plain page.
+  icon(entry, open, t) {
+    if (entry.dir) return svg(`mods/files/ft-folder${open ? "-open" : ""}.svg`).size(16).flex_none().text_color(FOLDER);
+    const type = fileType(entry.name);
+    if (!type) return svg("mods/files/file.svg").size(15).flex_none().text_color(t.muted);
+    if (type.glyph) return svg(`mods/files/ft-${type.glyph}.svg`).size(15).flex_none().text_color(type.color);
+    const n = type.badge.length;
+    return div().w(16).h(14).flex_none().flex().items_center().justify_center().rounded(3).bg(type.bg).text_color(type.fg)
+      .text_size(n > 2 ? 6 : n > 1 ? 7.5 : 9).font_semibold().line_height("14px").child(type.badge);
+  }
+
   rows(prefix, depth, out, t) {
     if (out.length >= TOTAL || depth > 40) return out;
     for (const entry of this.entries.get(prefix) ?? []) {
@@ -228,7 +289,7 @@ export default class Files extends View {
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
         .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
         .child(entry.dir ? svg(`mods/files/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
-        .child(svg(`mods/files/${entry.dir ? "folder" : "file"}.svg`).size(14).flex_none().text_color(t.muted))
+        .child(this.icon(entry, open, t))
         .child(div().flex_1().min_w(0).truncate().child(entry.name))
         .when(Boolean(mark), el => el.child(div().text_size(11).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark))));
       if (entry.dir && open) this.rows(path, depth + 1, out, t);
