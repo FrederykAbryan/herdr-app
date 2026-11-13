@@ -1,7 +1,8 @@
-// A lazy file browser for the focused pane's folder, with bounded read-only previews.
+// A lazy file browser for the focused pane's folder, with bounded previews. A local file's
+// preview turns into an editor with Edit: ctrl+s saves, refusing if the file changed on disk.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window } from "herdr";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
@@ -10,7 +11,23 @@ function location() {
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on, space: space?.id };
 }
 const key = () => JSON.stringify(location());
-const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
+const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", cjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html",
+  env: "bash", zsh: "bash", fish: "bash", bashrc: "bash", zshrc: "bash", profile: "bash", ini: "properties", conf: "properties", cfg: "properties",
+  yml: "yaml", py: "python", rs: "rust", h: "c", makefile: "make", mk: "make" };
+const MAX_EDIT = 400000;
+// The editor's language for a file: .env, .env.local, .env.production... read as shell
+// (keys, strings, ${VARS} and comments all get colors); others by extension.
+const langOf = (path) => {
+  const name = path.split("/").pop().toLowerCase();
+  if (name.startsWith(".env") || name.endsWith(".env")) return "bash";
+  const ext = name.includes(".") ? name.split(".").pop() : name;
+  return LANG[ext] ?? ext;
+};
+// Code colors: GitHub's dark palette in dark mode, the theme's in light.
+const syntaxFor = (t) => settings().dark === false
+  ? { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6, variable: t.ansi3, property: t.ansi4, operator: t.ansi5 }
+  : { keyword: "#ff7b72", string: "#a5d6ff", comment: "#8b949e", function: "#d2a8ff", type: "#ffa657", number: "#79c0ff", constant: "#79c0ff",
+      variable: "#ffa657", property: "#7ee787", operator: "#ff7b72" };
 const PER_FOLDER = 500, TOTAL = 5000;
 
 async function directory(path, on) {
@@ -129,6 +146,7 @@ export default class Files extends View {
 
   show(path, cx) {
     this.code?.release(); this.code = null; this.file = path; this.fileError = null;
+    this.text = null; this.editing = false; this.editNote = null; this.conflict = false;
     if (!path || !cx) return;
     const context = this.context, root = this.root, on = this.on;
     cx.spawn(async cx => {
@@ -137,14 +155,65 @@ export default class Files extends View {
         if (this.file !== path || !this.current(context)) return;
         if (text === null) { this.fileError = "This file is no longer available"; return; }
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
-        const t = theme(), ext = path.includes(".") ? path.split(".").pop() : "txt";
-        this.code = EditorState.new({ language: LANG[ext] ?? ext, readonly: true,
-          value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
-          font_family: settings().font_family, font_size: 12,
-          syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
+        this.text = text;
+        this.code = this.editor(path, text.length > MAX_EDIT ? text.slice(0, MAX_EDIT) + "\n… (file truncated)" : text, true);
       } catch { if (this.file === path && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
       finally { cx.notify(); }
     });
+  }
+
+  editor(path, value, readonly) {
+    const code = EditorState.new({ language: langOf(path), readonly, value,
+      font_family: settings().font_family, font_size: 12, syntax: syntaxFor(theme()) });
+    if (!readonly) code.on("change", (_e, cx) => { this.leaving = false; if (!this.conflict) this.editNote = null; cx.notify(); });
+    return code;
+  }
+
+  // Edit: here only (writeTextFile can't reach another machine), and not a truncated file.
+  canEdit() { return Boolean(this.file && this.text !== null && !this.on && this.text.length <= MAX_EDIT); }
+  dirty() { return Boolean(this.editing && this.code && this.code.value() !== this.text); }
+
+  setEditing(on, cx) {
+    if (!this.canEdit() || on === this.editing) return;
+    if (!on && this.dirty() && !this.leaving) { this.leaving = true; this.editNote = "Unsaved changes · click Done again to discard"; cx.notify(); return; }
+    this.code?.release();
+    this.editing = on; this.leaving = false; this.conflict = false; this.editNote = null;
+    this.code = this.editor(this.file, this.text, !on);
+    cx.notify();
+  }
+
+  save(cx, force = false) {
+    if (!this.editing || !this.code || this.saving) return;
+    const text = this.code.value(), path = this.file, full = `${this.root}/${path}`;
+    if (!force && text === this.text) return;
+    this.saving = true;
+    cx.spawn(async cx => {
+      try {
+        const expected = force ? await readTextFile(full) : this.text;
+        await writeTextFile(full, text, expected);
+        if (this.file === path) { this.text = text; this.conflict = false; this.leaving = false; this.editNote = "Saved"; }
+      } catch { if (this.file === path) { this.conflict = true; this.editNote = "Changed on disk since you opened it"; } }
+      finally { this.saving = false; cx.notify(); }
+    });
+    cx.notify();
+  }
+
+  // Back to the file as it is on disk now, dropping the edits.
+  reload(cx) {
+    const path = this.file;
+    cx.spawn(async cx => {
+      const text = await readTextFile(`${this.root}/${path}`).catch(() => null);
+      if (text !== null && this.file === path && this.code) { this.text = text; this.code.set_value(text); this.conflict = false; this.leaving = false; this.editNote = "Reloaded"; }
+      cx.notify();
+    });
+  }
+
+  button(id, label, click, t, enabled = true, strong = false) {
+    return div().id(id).h(24).px(8).flex().flex_none().items_center().rounded(6).text_size(12)
+      .when(strong && enabled, el => el.bg(t.solid).text_color(t.solid_foreground))
+      .when(!(strong && enabled), el => el.text_color(enabled ? t.muted : t.dim))
+      .when(enabled, el => el.cursor_pointer().hover(s => s.bg(strong ? t.solid : t.hover).text_color(strong ? t.solid_foreground : t.foreground)))
+      .on_click((_e, cx) => { if (enabled) click(cx); }).child(label);
   }
 
   rows(prefix, depth, out, t) {
@@ -166,14 +235,36 @@ export default class Files extends View {
   render(cx) {
     if (key() !== this.context?.key) this.refresh(cx);
     const t = theme();
+    const dirty = this.dirty();
     return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
+      .on_key_down((e, cx) => {
+        if (this.editing && e.key === "s" && (e.modifiers?.control || e.modifiers?.platform)) { this.save(cx); cx.stop_propagation(); }
+      })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-        .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.show(null); cx.notify(); }).child("←")))
+        .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => {
+          if (dirty) { this.editNote = "Save or discard your edits first"; cx.notify(); return; }
+          this.show(null); cx.notify();
+        }).child("←")))
         .child(div().font_semibold().child("Files"))
         .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? "")))
       .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
+      // Read-only preview with Edit, or the editor with Save / Done.
+      .when(Boolean(this.file) && this.canEdit(), el => el.child(h_flex().h(34).flex_none().px(8).gap(4).items_center().border_b(1).border_color(t.border).text_size(12)
+        .child(h_flex().flex_1().min_w(0).gap(6).items_center()
+          .when(this.editing, el => el.child(div().px(6).h(20).flex().flex_none().items_center().rounded(4).bg(t.accent + "26").text_color(t.accent).child("Editing")))
+          .when(dirty, el => el.child(div().flex_none().text_color(t.foreground).child("●")))
+          .when(Boolean(this.saving), el => el.child(div().flex_none().text_color(t.dim).child("saving…")))
+          .when(Boolean(this.editNote), el => el.child(div().min_w(0).truncate().text_color(this.conflict || this.leaving ? t.ansi1 : t.dim).child(this.editNote))))
+        .when(!this.editing, el => el.child(this.button("files-edit", "Edit", cx => this.setEditing(true, cx), t)))
+        .when(this.editing && this.conflict, el => el
+          .child(this.button("files-reload", "Reload", cx => this.reload(cx), t))
+          .child(this.button("files-overwrite", "Overwrite", cx => this.save(cx, true), t)))
+        .when(this.editing && dirty && !this.conflict, el => el.child(this.button("files-discard", "Discard", cx => this.reload(cx), t)))
+        .when(this.editing, el => el
+          .child(this.button("files-save", "Save", cx => this.save(cx), t, dirty && !this.saving, true))
+          .child(this.button("files-done", "Done", cx => this.setEditing(false, cx), t)))))
       .when(Boolean(this.file), el => el.child(this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")));
   }
 }

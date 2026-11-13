@@ -10,6 +10,7 @@
 #   git-graph -> git-graph       commit graph, opened from the Changes panel (new)
 #   workspace-status -> workspace-status-plus   status bar: click the branch to switch / create one
 #   spaces    -> spaces-plus     Spaces sidebar: groups (fold, drag in, right-click to move)
+#   files     -> files-plus      Files panel: colorful previews (.env too), Edit / Save
 #   menu      -> menu-plus       space menu with Move to group / New group, the group menu
 #
 # and a layout `main-focus` (a clone of `main`) that uses them. Your own layout stays as it
@@ -54,17 +55,20 @@ sed 's|^const SELF = "workspace-status";|const SELF = "workspace-status-plus";|'
 clone spaces spaces-plus
 sed 's|^const MENU = "menu";|const MENU = "menu-plus";|' "$src/spaces/main.js" > "$home/mods/spaces-plus/main.js"
 
+clone files files-plus
+sed 's|mods/files/|mods/files-plus/|g' "$src/files/main.js" > "$home/mods/files-plus/main.js"
+
 clone menu menu-plus
 sed 's|^const SELF = "menu";|const SELF = "menu-plus";|' "$src/menu/main.js" > "$home/mods/menu-plus/main.js"
 
-for m in spaces-plus menu-plus changes-focus agents-view tabs-plus pane-grid diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
+for m in spaces-plus menu-plus files-plus changes-focus agents-view tabs-plus pane-grid diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
 
 # The layout: clone main once, then point its blocks at the personal mods.
 [ -f "$home/layouts/main-focus.json" ] || herdr-app do layout.clone '{"name":"main","as":"main-focus"}' >/dev/null
 python3 -I - "$home/layouts/main-focus.json" <<'EOF'
 import json, sys
 path = sys.argv[1]
-swap = {"changes": "changes-focus", "agents": "agents-view", "tabs": "tabs-plus", "workspace-status": "workspace-status-plus", "spaces": "spaces-plus"}
+swap = {"changes": "changes-focus", "agents": "agents-view", "tabs": "tabs-plus", "workspace-status": "workspace-status-plus", "spaces": "spaces-plus", "files": "files-plus"}
 layout = json.load(open(path))
 def walk(node):
     if isinstance(node, dict):
