@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, agents, exec, readTextFile, watchFolder, theme, settings, shared, setShared } from "herdr";
+import { spaces, panes, focused, agents, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay } from "herdr";
 
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
@@ -485,6 +485,28 @@ export default class Changes extends View {
     cx.notify();
   }
 
+  // What a file is compared against in the side-by-side view (mods/diff-view): the same two
+  // states this panel's own diff shows.
+  sides(group, f) {
+    if (this.trees && group !== "outside") {
+      const s = this.session(), at = s?.at ? new Date(s.at) : null;
+      const since = at ? ` ${at.getHours()}:${String(at.getMinutes()).padStart(2, "0")}` : "";
+      return { left: this.trees.base, right: "worktree", leftLabel: `Session start${since}`, rightLabel: "Working tree" };
+    }
+    if (group === "staged" || group === "outside") return { left: this.hasHead ? "HEAD" : "none", right: "index", leftLabel: "HEAD", rightLabel: "Staged" };
+    return { left: f.fresh ? "none" : "index", right: "worktree", leftLabel: f.fresh ? "New file" : "Index", rightLabel: "Working tree" };
+  }
+
+  // Opens the file big, old and new side by side, with every listed file a step away.
+  compare(key, cx) {
+    if (!this.root) return;
+    const files = [];
+    for (const g of this.groups) for (const f of g.items) files.push({ key: `${g.id}|${f.path}`, path: f.path, status: f.status, ...this.sides(g.id, f) });
+    const index = files.findIndex((f) => f.key === key);
+    if (index < 0) return;
+    openOverlay({ mod: "diff-view", kind: "dialog", width: 0.94, height: 0.92, props: { root: this.root, on: this.on, files, index } });
+  }
+
   // Stage and unstage change the repo's index, as `git add` / `git restore --staged` would.
   gitAction(args, cx) {
     if (!this.root || this.busy) return;
@@ -596,14 +618,19 @@ export default class Changes extends View {
   fileRow(group, f, depth, t) {
     const key = `${group}|${f.path}`, parts = f.path.split("/"), name = parts.pop();
     const action = this.hovered === key ? this.rowAction(group, key, [f.path], t) : null;
+    const compare = this.hovered === key ? div().id(`compare-${key}`).size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+      .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.compare(key, cx))
+      .child(svg("mods/diff-view/split.svg").size(16)) : null;
     return this.hoverable(h_flex().id(key).h(24).flex_none().pl(20 + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer()
-      .when(this.open === key, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(key, cx))
+      .when(this.open === key, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((e, cx) => { if (e.click_count === 2) this.compare(key, cx); else this.pick(key, cx); })
       // In the tree a file lines up under its folder's icon, past the chevron column.
       .when(this.tree, (e) => e.child(div().w(16).flex_none()))
       .child(icon("file", 16).text_color(fileTint(f.path, t)))
       .child(h_flex().flex_1().min_w(0).gap(6).items_center()
         .child(div().min_w(0).max_w(240).truncate().text_color(f.status === "D" ? t.dim : t.foreground).child(name))
         .when(!this.tree && parts.length > 0, (e) => e.child(div().min_w(0).truncate().text_size(11).text_color(t.dim).child(parts.join("/")))))
+      .when(Boolean(compare), (e) => e.child(compare))
       .when(Boolean(action), (e) => e.child(action))
       .child(div().w(14).flex_none().text_right().text_size(11).font_semibold().text_color(t[LETTER_TINT[f.status]] ?? t.muted).child(f.status)), key);
   }
@@ -705,7 +732,11 @@ export default class Changes extends View {
           .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.rows.length, 22, (i) => String(i),
             (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
         .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
-        .when(!this.open && total > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes"))))
+        .when(!this.open && total > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes")))
+        .when(Boolean(this.open && this.item(this.open).item), (e) => e.child(h_flex().id("compare-open").absolute().top(6).right(14).h(24).px(8).gap(5).items_center()
+          .rounded(6).border_1().border_color(t.border).bg(t.raised).text_size(11.5).text_color(t.muted).cursor_pointer().font_family(settings().ui_font ?? "Geist")
+          .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => this.compare(this.open, cx))
+          .child(svg("mods/diff-view/split.svg").size(14)).child("Compare"))))
       .when(Boolean(this.note), (e) => e.child(div().px(10).py(8).text_size(11).text_color(t.ansi1).child(this.note)));
   }
 }

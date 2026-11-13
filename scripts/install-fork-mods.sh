@@ -6,6 +6,7 @@
 #   agents    -> agents-view     Agents sidebar: group / sort / hide idle
 #   tabs      -> tabs-plus       Tab bar: grid layouts and full screen
 #   pane-grid -> pane-grid       the grid menu (new)
+#   diff-view -> diff-view       side-by-side compare, opened from the Changes panel (new)
 #
 # and a layout `main-focus` (a clone of `main`) that uses them. Your own layout stays as it
 # was: switch with ctrl-shift-l. Personal mods are never overwritten by app updates.
@@ -37,7 +38,10 @@ cp "$src"/tabs/scm-*.svg "$src/tabs/CODICONS-LICENSE" "$home/mods/tabs-plus/"
 mkdir -p "$home/mods/pane-grid"
 cp "$src/pane-grid/main.js" "$src/pane-grid/mod.json" "$home/mods/pane-grid/"
 
-for m in changes-focus agents-view tabs-plus pane-grid; do herdr-app check "$home/mods/$m"; done
+mkdir -p "$home/mods/diff-view"
+cp "$src"/diff-view/* "$home/mods/diff-view/"
+
+for m in changes-focus agents-view tabs-plus pane-grid diff-view; do herdr-app check "$home/mods/$m"; done
 
 # The layout: clone main once, then point its blocks at the personal mods.
 [ -f "$home/layouts/main-focus.json" ] || herdr-app do layout.clone '{"name":"main","as":"main-focus"}' >/dev/null
