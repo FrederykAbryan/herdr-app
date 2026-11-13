@@ -234,6 +234,9 @@ export default class Changes extends View {
     try { this.tree = localStorage.getItem("view") !== "list"; } catch { this.tree = true; }
     // The diff under the list can be put away: files then open in the side-by-side compare.
     try { this.preview = localStorage.getItem("preview") !== "off"; } catch { this.preview = true; }
+    // The file list's height when dragged (the line above the diff); null: as tall as its rows.
+    try { const h = Number(localStorage.getItem("listHeight")); this.listH = h > 0 ? h : null; } catch { this.listH = null; }
+    this.panelH = 800; this.listMeasured = 200;
     this.input = InputState.new({ placeholder: "Message (Enter to commit)" });
     this.input.on("change", (_e, cx) => {
       const hadMessage = Boolean(this.message.trim());
@@ -487,6 +490,13 @@ export default class Changes extends View {
     this.diffWidth = Math.max(300, ...this.rows.map(row => (row.text.length + 1) * 7.6 + 70));
   }
 
+  endResize(cx) {
+    if (!this.resizing) return;
+    this.resizing = null;
+    try { localStorage.setItem("listHeight", String(this.listH ?? 0)); } catch {}
+    cx.notify();
+  }
+
   setPreview(on, cx) {
     this.preview = on;
     try { localStorage.setItem("preview", on ? "on" : "off"); } catch {}
@@ -719,6 +729,15 @@ export default class Changes extends View {
     }
     const empty = this.error || (this.loading ? "Loading changes…" : !this.root ? "No folder" : this.mode === "session" ? "This session hasn't changed anything yet" : "No changes");
     return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
+      .on_size_change((size, cx) => { if (Math.abs(size.height - this.panelH) > 1) { this.panelH = size.height; cx.notify(); } })
+      // Dragging the line between the list and the diff: pressed on the line, moved anywhere.
+      .on_mouse_move((e, cx) => {
+        if (!this.resizing) return;
+        this.listH = Math.round(Math.min(Math.max(44, this.panelH - 160), Math.max(44, this.resizing.h + e.position.y - this.resizing.y)));
+        cx.notify();
+      })
+      .on_mouse_up("left", (_e, cx) => this.endResize(cx))
+      .on_hover((hovered, cx) => { if (!hovered) this.endResize(cx); })
       .on_key_down((e, cx) => {
         if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
       })
@@ -753,26 +772,43 @@ export default class Changes extends View {
       .when(total > 0, (el) => el.child(div().px(14).pt(4).text_size(11).text_color(t.dim)
         .child(staged ? `${staged} staged${this.group("outside").length ? ` · ${this.group("outside").length} from outside this session` : ""}` : "Nothing staged · stage files with +")))
       // Tall enough for every row, plus the empty note (which can wrap) when there are none.
-      .child(div().mt(8).flex_1().min_h(44).when(this.preview, (e) => e.max_h(rows.length * 24 + 12 + (total ? 0 : 48))).relative().border_t(1).border_b(1).border_color(t.border)
+      .child(div().id("changes-list-box").mt(8).min_h(44).relative().border_t(1).border_color(t.border)
+        .on_size_change((size) => { this.listMeasured = size.height; })
+        .when(!this.preview, (e) => e.flex_1().border_b(1))
+        .when(this.preview && this.listH === null, (e) => e.flex_1().max_h(rows.length * 24 + 12 + (total ? 0 : 48)))
+        .when(this.preview && this.listH !== null, (e) => e.flex_none().h(Math.min(this.listH, Math.max(44, this.panelH - 160))))
         .child(v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6)
           .children(rows.map((row) => row.group ? this.groupRow(row.group, t) : row.file ? this.fileRow(row.in, row.file, row.depth, t) : this.dirRow(row.in, row, t)))
           .when(!total, (e) => e.child(div().px(8).py(4).text_size(12).text_color(t.dim).child(empty))))
         .child(Scrollbar.vertical("changes-list").absolute().inset_0()))
       .when(this.limited, el => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 files of a group")))
-      .when(this.preview, (pv) => pv.child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12.5)
-        .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
-          .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.rows.length, 22, (i) => String(i),
-            (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
-        .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
-        .when(!this.open && total > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes")))
-        .when(Boolean(this.open && this.item(this.open).item), (e) => e.child(h_flex().id("compare-open").absolute().top(6).right(14).h(24).px(8).gap(5).items_center()
-          .rounded(6).border_1().border_color(t.border).bg(t.raised).text_size(11.5).text_color(t.muted).cursor_pointer().font_family(settings().ui_font ?? "Geist")
-          .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => this.compare(this.open, cx))
-          .child(svg("mods/diff-view/split.svg").size(14)).child("Compare")))
-        .child(div().id("preview-off").absolute().top(6).right(this.open && this.item(this.open).item ? 104 : 14).size(24).flex().items_center().justify_center()
-          .rounded(6).border_1().border_color(t.border).bg(t.raised).text_color(t.muted).cursor_pointer()
-          .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => this.setPreview(false, cx))
-          .child(svg("mods/diff-view/close.svg").size(14)))))
+      .when(this.preview, (pv) => pv
+        // The line between the list and the diff: drag to resize, double-click to fit the list again.
+        .child(div().id("list-resize").h(7).flex_none().flex().flex_col().justify_center().cursor_row_resize()
+          .on_mouse_down("left", (e, cx) => {
+            cx.stop_propagation();
+            if (e.click_count === 2) { this.listH = null; this.resizing = null; try { localStorage.setItem("listHeight", "0"); } catch {} }
+            else this.resizing = { y: e.position.y, h: this.listH ?? this.listMeasured };
+            cx.notify();
+          })
+          .child(div().w_full().h(this.resizing ? 3 : 1).bg(this.resizing ? t.accent : t.border).hover((st) => st.bg(t.accent))))
+        // The diff's own bar: which file, open it side by side, put the preview away.
+        .child(h_flex().h(30).flex_none().pl(12).pr(6).gap(4).items_center().border_b(1).border_color(t.border).text_size(11.5)
+          .child(div().flex_1().min_w(0).truncate().text_color(this.open ? t.muted : t.dim)
+            .child(this.open ? this.item(this.open).path : total > 0 ? "Select a file to view its changes" : ""))
+          .when(Boolean(this.open && this.item(this.open).item), (e) => e.child(h_flex().id("compare-open").h(22).px(7).gap(5).flex_none().items_center()
+            .rounded(5).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.compare(this.open, cx))
+            .child(svg("mods/diff-view/split.svg").size(14)).child("Compare")))
+          .child(div().id("preview-off").size(22).flex_none().flex().items_center().justify_center().rounded(5).text_color(t.muted).cursor_pointer()
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.setPreview(false, cx))
+            .child(svg("mods/diff-view/close.svg").size(14))))
+        .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12.5)
+          .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
+            .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.rows.length, 22, (i) => String(i),
+              (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
+          .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())))
       // With the preview put away the list fills the panel; this bar brings the preview back.
       .when(!this.preview, (e) => e.child(h_flex().id("preview-show").mx(10).mb(10).mt(6).h(30).flex_none().gap(6).items_center().justify_center()
         .rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted).cursor_pointer()
