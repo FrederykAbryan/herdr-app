@@ -752,6 +752,9 @@ export default class Changes extends View {
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.setPreview(true, cx))
           .child(svg("mods/diff-view/split.svg").size(16))))
         .child(this.iconButton("view", this.tree ? "list-flat" : "list-tree", (cx) => this.toggleTree(cx), t))
+        // The repo's history as a graph (mods/git-graph); only in a git repository.
+        .when(Boolean(this.root), (e) => e.child(this.iconButton("graph", "graph", () =>
+          openOverlay({ mod: "git-graph", kind: "dialog", width: 0.94, height: 0.92, props: { root: this.root, on: this.on } }), t)))
         .child(this.iconButton("refresh", "refresh", (cx) => this.refresh(cx), t)))
       // Which pane the panel follows: with several terminals or agents in a tab, the focused one.
       .when(Boolean(following), (el) => el.child(h_flex().h(22).flex_none().px(14).gap(6).items_center().text_size(11).text_color(t.dim)
