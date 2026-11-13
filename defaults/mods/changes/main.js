@@ -220,6 +220,8 @@ export default class Changes extends View {
     this.pending = new Set(); this.queue = {}; this.collapsed = new Set(); this.collapsedGroups = new Set(["committed"]);
     try { this.mode = localStorage.getItem("mode") === "all" ? "all" : "session"; } catch { this.mode = "session"; }
     try { this.tree = localStorage.getItem("view") !== "list"; } catch { this.tree = true; }
+    // The diff under the list can be put away: files then open in the side-by-side compare.
+    try { this.preview = localStorage.getItem("preview") !== "off"; } catch { this.preview = true; }
     this.input = InputState.new({ placeholder: "Message (Enter to commit)" });
     this.input.on("change", (_e, cx) => {
       const hadMessage = Boolean(this.message.trim());
@@ -426,7 +428,7 @@ export default class Changes extends View {
         if (this.open && !this.item(this.open).item) { this.open = null; this.setLines([]); }
         // The first file's diff shows until you pick another.
         const first = groups.find((g) => g.items.length);
-        if (!this.open && !this.closed && first) this.open = `${first.id}|${first.items[0].path}`;
+        if (!this.open && !this.closed && first && this.preview) this.open = `${first.id}|${first.items[0].path}`;
         if (!first) this.setLines([]);
         if (this.open) {
           try { await this.load(this.open, context); }
@@ -473,7 +475,16 @@ export default class Changes extends View {
     this.diffWidth = Math.max(300, ...this.rows.map(row => (row.text.length + 1) * 7.6 + 70));
   }
 
+  setPreview(on, cx) {
+    this.preview = on;
+    try { localStorage.setItem("preview", on ? "on" : "off"); } catch {}
+    if (!on) { this.open = null; this.setLines([]); this.closed = true; }
+    else { this.closed = false; this.refresh(cx); }
+    cx.notify();
+  }
+
   pick(key, cx) {
+    if (!this.preview) { this.compare(key, cx); return; }
     this.open = this.open === key ? null : key; this.setLines([]); this.note = null;
     this.closed = !this.open;
     const context = this.context;
@@ -700,6 +711,10 @@ export default class Changes extends View {
           .child(this.pill("mode-session", "Session", this.mode === "session", (cx) => this.setMode("session", cx), t))
           .child(this.pill("mode-all", "All", this.mode === "all", (cx) => this.setMode("all", cx), t)))
         .child(div().flex_1())
+        .when(!this.preview, (e) => e.child(div().id("preview-on").size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+          .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.setPreview(true, cx))
+          .child(svg("mods/diff-view/split.svg").size(16))))
         .child(this.iconButton("view", this.tree ? "list-flat" : "list-tree", (cx) => this.toggleTree(cx), t))
         .child(this.iconButton("refresh", "refresh", (cx) => this.refresh(cx), t)))
       // Which pane the panel follows: with several terminals or agents in a tab, the focused one.
@@ -721,13 +736,13 @@ export default class Changes extends View {
       .when(total > 0, (el) => el.child(div().px(14).pt(4).text_size(11).text_color(t.dim)
         .child(staged ? `${staged} staged${this.group("outside").length ? ` · ${this.group("outside").length} from outside this session` : ""}` : "Nothing staged · stage files with +")))
       // Tall enough for every row, plus the empty note (which can wrap) when there are none.
-      .child(div().mt(8).flex_1().min_h(44).max_h(rows.length * 24 + 12 + (total ? 0 : 48)).relative().border_t(1).border_b(1).border_color(t.border)
+      .child(div().mt(8).flex_1().min_h(44).when(this.preview, (e) => e.max_h(rows.length * 24 + 12 + (total ? 0 : 48))).relative().border_t(1).border_b(1).border_color(t.border)
         .child(v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6)
           .children(rows.map((row) => row.group ? this.groupRow(row.group, t) : row.file ? this.fileRow(row.in, row.file, row.depth, t) : this.dirRow(row.in, row, t)))
           .when(!total, (e) => e.child(div().px(8).py(4).text_size(12).text_color(t.dim).child(empty))))
         .child(Scrollbar.vertical("changes-list").absolute().inset_0()))
       .when(this.limited, el => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 files of a group")))
-      .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12.5)
+      .when(this.preview, (pv) => pv.child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12.5)
         .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
           .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.rows.length, 22, (i) => String(i),
             (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
@@ -736,7 +751,11 @@ export default class Changes extends View {
         .when(Boolean(this.open && this.item(this.open).item), (e) => e.child(h_flex().id("compare-open").absolute().top(6).right(14).h(24).px(8).gap(5).items_center()
           .rounded(6).border_1().border_color(t.border).bg(t.raised).text_size(11.5).text_color(t.muted).cursor_pointer().font_family(settings().ui_font ?? "Geist")
           .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => this.compare(this.open, cx))
-          .child(svg("mods/diff-view/split.svg").size(14)).child("Compare"))))
+          .child(svg("mods/diff-view/split.svg").size(14)).child("Compare")))
+        .child(div().id("preview-off").absolute().top(6).right(this.open && this.item(this.open).item ? 104 : 14).size(24).flex().items_center().justify_center()
+          .rounded(6).border_1().border_color(t.border).bg(t.raised).text_color(t.muted).cursor_pointer()
+          .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => this.setPreview(false, cx))
+          .child(svg("mods/diff-view/close.svg").size(14)))))
       .when(Boolean(this.note), (e) => e.child(div().px(10).py(8).text_size(11).text_color(t.ansi1).child(this.note)));
   }
 }
