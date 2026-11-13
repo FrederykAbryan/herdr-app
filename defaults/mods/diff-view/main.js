@@ -13,6 +13,10 @@ import { exec, theme, settings, props, closeOverlay, readTextFile, writeTextFile
 
 const SELF = "mods/diff-view";
 const icon = (name, size = 16) => svg(`${SELF}/${name}.svg`).size(size).flex_none();
+// Edit-button icon colors: vivid in dark mode (the theme's ANSI colors are pale there), the theme's in light.
+const tint = (t) => settings().dark === false
+  ? { edit: t.accent, save: t.ansi2, done: t.ansi4, discard: t.ansi1, reload: t.ansi3, overwrite: t.ansi9 }
+  : { edit: "#58a6ff", save: "#3fb950", done: "#58a6ff", discard: "#f85149", reload: "#d29922", overwrite: "#ff7b72" };
 const CONTEXT = 3, ROW = 20, CHAR = 7.6;
 // The editor's language names, as in the Files panel.
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
@@ -422,10 +426,12 @@ export default class DiffView extends View {
       .child(this.half(row.r, same ? "same" : row.r ? "+" : "gap", rw, t, cur));
   }
 
-  button(id, name, label, click, t, enabled = true) {
+  // color: the icon's own color (what the button does), dim while disabled.
+  button(id, name, label, click, t, enabled = true, tip = null, color = null) {
     return h_flex().id(id).h(26).px(label ? 8 : 0).when(!label, (e) => e.w(26).justify_center()).gap(5).items_center().flex_none().rounded(6)
-      .text_size(12).text_color(enabled ? t.muted : t.dim).when(enabled, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)))
+      .text_size(12).text_color(enabled ? color ?? t.muted : color ? color + "66" : t.dim).when(enabled, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover).text_color(color ?? t.foreground)))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .when(Boolean(tip), (e) => e.tooltip(tip))
       .on_click((_e, cx) => { if (enabled) click(cx); })
       .when(Boolean(name), (e) => e.child(icon(name, 16))).when(Boolean(label), (e) => e.child(label));
   }
@@ -439,18 +445,18 @@ export default class DiffView extends View {
   // The bar over the editor: what's edited, whether it's saved, and save / discard / done.
   editBar(t) {
     const dirty = this.dirty(), warn = this.conflict || this.leaving;
-    return h_flex().h(36).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border).text_size(12)
+    return h_flex().h(36).flex_none().px(12).gap(2).items_center().border_b(1).border_color(t.border).text_size(12)
       .child(h_flex().flex_1().min_w(0).gap(8).items_center()
         .child(div().px(6).h(20).flex().items_center().rounded(4).bg(t.accent + "26").text_color(t.accent).child("Editing · Working tree"))
         .when(dirty, (e) => e.child(div().flex_none().text_color(t.foreground).child("● unsaved")))
         .when(Boolean(this.saving), (e) => e.child(div().flex_none().text_color(t.dim).child("saving…")))
         .when(Boolean(this.editNote) && Boolean(this.ed), (e) => e.child(div().min_w(0).truncate().text_color(warn ? t.ansi1 : t.dim).child(this.editNote))))
       .when(this.conflict, (e) => e
-        .child(this.button("edit-reload", null, "Reload from disk", (cx) => this.reload(cx), t))
-        .child(this.button("edit-overwrite", null, "Overwrite", (cx) => this.save(cx, true), t)))
-      .when(dirty && !this.conflict, (e) => e.child(this.button("edit-discard", null, "Discard", (cx) => this.reload(cx), t)))
-      .child(this.button("edit-save", null, "Save", (cx) => this.save(cx), t, dirty && !this.saving))
-      .child(this.button("edit-done", null, "Done", (cx) => this.leaveEdit(cx), t));
+        .child(this.button("edit-reload", "refresh", null, (cx) => this.reload(cx), t, true, "Reload from disk (drop your edits)", tint(t).reload))
+        .child(this.button("edit-overwrite", "overwrite", null, (cx) => this.save(cx, true), t, true, "Overwrite the file on disk", tint(t).overwrite)))
+      .when(dirty && !this.conflict, (e) => e.child(this.button("edit-discard", "discard", null, (cx) => this.reload(cx), t, true, "Discard changes", tint(t).discard)))
+      .child(this.button("edit-save", "save", null, (cx) => this.save(cx), t, dirty && !this.saving, "Save (ctrl+s)", tint(t).save))
+      .child(this.button("edit-done", "check", null, (cx) => this.leaveEdit(cx), t, true, "Done: back to compare (Esc)", tint(t).done));
   }
 
   render(cx) {
@@ -505,7 +511,7 @@ export default class DiffView extends View {
           .when(Boolean(this.stats && (this.stats.add || this.stats.del)), (e) => e
             .child(div().flex_none().text_size(12).text_color(t.ansi2).child(`+${this.stats.add}`))
             .child(div().flex_none().text_size(12).text_color(t.ansi1).child(`−${this.stats.del}`))))
-        .when(this.canEdit() && !editing, (e) => e.child(this.button("edit", "edit", "Edit", (cx) => this.startEdit(cx), t)))
+        .when(this.canEdit() && !editing, (e) => e.child(this.button("edit", "edit", null, (cx) => this.startEdit(cx), t, true, "Edit (e)", tint(t).edit)))
         .when(this.files.length > 1, (e) => e.child(h_flex().flex_none().gap(2).items_center()
           .child(this.button("file-prev", "chevron-left", null, (cx) => this.openFile(this.index - 1, cx), t, this.index > 0))
           .child(div().text_size(12).text_color(t.muted).child(`${this.index + 1} / ${this.files.length} files`))

@@ -15,6 +15,10 @@ const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", 
   env: "bash", zsh: "bash", fish: "bash", bashrc: "bash", zshrc: "bash", profile: "bash", ini: "properties", conf: "properties", cfg: "properties",
   yml: "yaml", py: "python", rs: "rust", h: "c", makefile: "make", mk: "make" };
 const MAX_EDIT = 400000;
+// Edit-button icon colors: vivid in dark mode (the theme's ANSI colors are pale there), the theme's in light.
+const tint = (t) => settings().dark === false
+  ? { edit: t.accent, save: t.ansi2, done: t.ansi4, discard: t.ansi1, reload: t.ansi3, overwrite: t.ansi9 }
+  : { edit: "#58a6ff", save: "#3fb950", done: "#58a6ff", discard: "#f85149", reload: "#d29922", overwrite: "#ff7b72" };
 // The editor's language for a file: .env, .env.local, .env.production... read as shell
 // (keys, strings, ${VARS} and comments all get colors); others by extension.
 const langOf = (path) => {
@@ -208,12 +212,12 @@ export default class Files extends View {
     });
   }
 
-  button(id, label, click, t, enabled = true, strong = false) {
-    return div().id(id).h(24).px(8).flex().flex_none().items_center().rounded(6).text_size(12)
-      .when(strong && enabled, el => el.bg(t.solid).text_color(t.solid_foreground))
-      .when(!(strong && enabled), el => el.text_color(enabled ? t.muted : t.dim))
-      .when(enabled, el => el.cursor_pointer().hover(s => s.bg(strong ? t.solid : t.hover).text_color(strong ? t.solid_foreground : t.foreground)))
-      .on_click((_e, cx) => { if (enabled) click(cx); }).child(label);
+  // An icon button (icons from the compare view's set) with its name on hover.
+  button(id, name, tip, click, t, enabled = true, color = null) {
+    return div().id(id).size(24).flex().flex_none().items_center().justify_center().rounded(6).tooltip(tip)
+      .text_color(enabled ? color ?? t.muted : color ? color + "66" : t.dim)
+      .when(enabled, el => el.cursor_pointer().hover(s => s.bg(t.hover).text_color(color ?? t.foreground)))
+      .on_click((_e, cx) => { if (enabled) click(cx); }).child(svg(`mods/diff-view/${name}.svg`).size(15));
   }
 
   rows(prefix, depth, out, t) {
@@ -257,14 +261,14 @@ export default class Files extends View {
           .when(dirty, el => el.child(div().flex_none().text_color(t.foreground).child("●")))
           .when(Boolean(this.saving), el => el.child(div().flex_none().text_color(t.dim).child("saving…")))
           .when(Boolean(this.editNote), el => el.child(div().min_w(0).truncate().text_color(this.conflict || this.leaving ? t.ansi1 : t.dim).child(this.editNote))))
-        .when(!this.editing, el => el.child(this.button("files-edit", "Edit", cx => this.setEditing(true, cx), t)))
+        .when(!this.editing, el => el.child(this.button("files-edit", "edit", "Edit", cx => this.setEditing(true, cx), t, true, tint(t).edit)))
         .when(this.editing && this.conflict, el => el
-          .child(this.button("files-reload", "Reload", cx => this.reload(cx), t))
-          .child(this.button("files-overwrite", "Overwrite", cx => this.save(cx, true), t)))
-        .when(this.editing && dirty && !this.conflict, el => el.child(this.button("files-discard", "Discard", cx => this.reload(cx), t)))
+          .child(this.button("files-reload", "refresh", "Reload from disk (drop your edits)", cx => this.reload(cx), t, true, tint(t).reload))
+          .child(this.button("files-overwrite", "overwrite", "Overwrite the file on disk", cx => this.save(cx, true), t, true, tint(t).overwrite)))
+        .when(this.editing && dirty && !this.conflict, el => el.child(this.button("files-discard", "discard", "Discard changes", cx => this.reload(cx), t, true, tint(t).discard)))
         .when(this.editing, el => el
-          .child(this.button("files-save", "Save", cx => this.save(cx), t, dirty && !this.saving, true))
-          .child(this.button("files-done", "Done", cx => this.setEditing(false, cx), t)))))
+          .child(this.button("files-save", "save", "Save (ctrl+s)", cx => this.save(cx), t, dirty && !this.saving, tint(t).save))
+          .child(this.button("files-done", "check", "Done", cx => this.setEditing(false, cx), t, true, tint(t).done)))))
       .when(Boolean(this.file), el => el.child(this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")));
   }
 }
