@@ -1,16 +1,21 @@
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, VirtualListScrollHandle, v_virtual_list } from "gpui-base";
-import { exec, theme, settings, props, closeOverlay } from "herdr";
+import { v_flex, h_flex, Scrollbar, VirtualListScrollHandle, v_virtual_list, Editor, EditorState } from "gpui-base";
+import { exec, theme, settings, props, closeOverlay, readTextFile, writeTextFile } from "herdr";
 
 // Compare a changed file with how it was before, side by side (or inline), as a dialog over the
 // window. Opened by the Changes panel with props:
 //   { root, on, files: [{ path, status, left, right, leftLabel, rightLabel }], index }
 // left/right: "none" (the file isn't there), "worktree", "index", or a commit/tree id ("HEAD", a
 // session snapshot). The right side is read again every few seconds, so an agent's edits show live.
+// Edit (or props.edit) swaps the compare for an editor of the working-tree file: ctrl+s saves,
+// refusing if the file changed on disk meanwhile. Local files only: writeTextFile can't reach
+// another machine.
 
 const SELF = "mods/diff-view";
 const icon = (name, size = 16) => svg(`${SELF}/${name}.svg`).size(size).flex_none();
 const CONTEXT = 3, ROW = 20, CHAR = 7.6;
+// The editor's language names, as in the Files panel.
+const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
 
 // The terminal palette: GitHub's dark syntax colors, made to read on green and red diff rows,
 // on solid rows a little stronger than GitHub's; changed words a step brighter than their row.
@@ -148,15 +153,89 @@ export default class DiffView extends View {
     this.width = 1200; this.change = -1;
     // Where the line between the sides sits, as a share of the width: dragged, remembered.
     try { this.ratio = Math.min(0.85, Math.max(0.15, Number(localStorage.getItem("ratio")) || 0.5)); } catch { this.ratio = 0.5; }
+    this.ed = null; this.saved = null; this.editNote = null; this.conflict = false; this.leaving = false;
     this.load(cx, true);
     cx.timer.every(2500, (cx) => this.load(cx, false));
+    if (p.edit && this.canEdit()) this.startEdit(cx);
+  }
+
+  close() { this.ed?.release(); }
+
+  // Editing: the working-tree side of a local file.
+  canEdit() { const f = this.file(); return Boolean(f && this.root && !this.on && f.right === "worktree"); }
+  editing() { return this.ed !== null || this.opening; }
+  dirty() { return Boolean(this.ed && this.saved !== null && this.ed.value() !== this.saved); }
+  pathOf(f) { return `${this.root}/${f.path}`; }
+
+  startEdit(cx) {
+    const f = this.file();
+    if (!this.canEdit() || this.editing()) return;
+    this.opening = true; this.editNote = null; this.conflict = false; this.leaving = false;
+    cx.spawn(async (cx) => {
+      try {
+        const text = await readTextFile(this.pathOf(f));
+        if (this.file() !== f) return;
+        if (text === null) { this.editNote = "This file isn't in the working tree any more"; return; }
+        if (text.includes("\0")) { this.editNote = "Binary file · can't edit here"; return; }
+        const s = this.look(theme()).syntax, ext = f.path.includes(".") ? f.path.split(".").pop().toLowerCase() : "txt";
+        this.saved = text;
+        this.ed = EditorState.new({ language: LANG[ext] ?? ext, value: text, readonly: false,
+          font_family: settings().font_family ?? "JetBrains Mono", font_size: 12.5,
+          syntax: { keyword: s.keyword, string: s.string, comment: s.comment, function: s.function, type: s.type, number: s.number, constant: s.literal } });
+        this.ed.on("change", (_e, cx) => { this.leaving = false; if (!this.conflict) this.editNote = null; cx.notify(); });
+      } catch (e) { this.editNote = `Cannot open for editing: ${e?.message ?? e}`; }
+      finally { this.opening = false; cx.notify(); }
+    });
+    cx.notify();
+  }
+
+  // force: write over a file that changed on disk since it was opened (or last saved).
+  save(cx, force = false) {
+    const f = this.file();
+    if (!this.ed || this.saving) return;
+    const text = this.ed.value();
+    if (!force && text === this.saved) return;
+    this.saving = true;
+    cx.spawn(async (cx) => {
+      try {
+        const expected = force ? await readTextFile(this.pathOf(f)) : this.saved;
+        await writeTextFile(this.pathOf(f), text, expected);
+        this.saved = text; this.conflict = false; this.leaving = false; this.editNote = "Saved";
+      } catch (e) {
+        this.conflict = true;
+        this.editNote = `Not saved: the file changed on disk since you opened it (${e?.message ?? e})`;
+      } finally { this.saving = false; cx.notify(); }
+    });
+    cx.notify();
+  }
+
+  // Throws away the edits and takes the file as it is on disk now.
+  reload(cx) {
+    const f = this.file();
+    cx.spawn(async (cx) => {
+      const text = await readTextFile(this.pathOf(f)).catch(() => null);
+      if (text !== null && this.ed && this.file() === f) { this.saved = text; this.ed.set_value(text); this.conflict = false; this.leaving = false; this.editNote = "Reloaded from disk"; }
+      cx.notify();
+    });
+  }
+
+  // Back to the compare, which then shows the saved edits.
+  stopEdit(cx) {
+    this.ed?.release(); this.ed = null; this.saved = null; this.editNote = null; this.conflict = false; this.leaving = false;
+    this.load(cx, true);
+  }
+
+  // Esc: leaves at once when nothing is unsaved, else asks for a second Esc.
+  leaveEdit(cx) {
+    if (this.dirty() && !this.leaving) { this.leaving = true; this.editNote = "Unsaved changes · Esc again to discard them, ctrl+s to save"; cx.notify(); return; }
+    this.stopEdit(cx);
   }
 
   file() { return this.files[this.index]; }
 
   load(cx, fresh) {
     const f = this.file();
-    if (!f || !this.root || (this.loading && !fresh)) return;
+    if (!f || !this.root || (this.loading && !fresh) || (this.editing() && !fresh)) return;
     const seq = (this.seq = (this.seq ?? 0) + 1);
     if (fresh) { this.rows = null; this.note = null; this.raw = null; this.expanded = new Set(); this.change = -1; this.items = null; }
     this.loading = true;
@@ -241,7 +320,11 @@ export default class DiffView extends View {
   }
   openFile(index, cx) {
     if (index < 0 || index >= this.files.length || index === this.index) return;
+    if (this.dirty()) { this.editNote = "Save or discard your edits before opening another file"; cx.notify(); return; }
+    const wasEditing = this.editing();
+    if (wasEditing) { this.ed?.release(); this.ed = null; this.saved = null; this.editNote = null; }
     this.index = index; this.load(cx, true);
+    if (wasEditing && this.canEdit()) this.startEdit(cx);
   }
 
   // Lines as the list draws them. Split: one per row. Inline: a change row becomes its − then its +.
@@ -258,7 +341,10 @@ export default class DiffView extends View {
     return out;
   }
 
-  dismiss() { const id = props()?.overlay; if (id) closeOverlay(id); }
+  dismiss(cx) {
+    if (this.dirty() && cx) { this.editNote = "Unsaved changes · save (ctrl+s) or discard them before closing"; cx.notify(); return; }
+    const id = props()?.overlay; if (id) closeOverlay(id);
+  }
 
   tokens(cell) {
     if (!cell.tokens) cell.tokens = markTokens(tokenize(cell.text, this.lang ?? langOf("")), cell.mark);
@@ -350,6 +436,23 @@ export default class DiffView extends View {
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => click(cx)).child(label);
   }
 
+  // The bar over the editor: what's edited, whether it's saved, and save / discard / done.
+  editBar(t) {
+    const dirty = this.dirty(), warn = this.conflict || this.leaving;
+    return h_flex().h(36).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border).text_size(12)
+      .child(h_flex().flex_1().min_w(0).gap(8).items_center()
+        .child(div().px(6).h(20).flex().items_center().rounded(4).bg(t.accent + "26").text_color(t.accent).child("Editing · Working tree"))
+        .when(dirty, (e) => e.child(div().flex_none().text_color(t.foreground).child("● unsaved")))
+        .when(Boolean(this.saving), (e) => e.child(div().flex_none().text_color(t.dim).child("saving…")))
+        .when(Boolean(this.editNote) && Boolean(this.ed), (e) => e.child(div().min_w(0).truncate().text_color(warn ? t.ansi1 : t.dim).child(this.editNote))))
+      .when(this.conflict, (e) => e
+        .child(this.button("edit-reload", null, "Reload from disk", (cx) => this.reload(cx), t))
+        .child(this.button("edit-overwrite", null, "Overwrite", (cx) => this.save(cx, true), t)))
+      .when(dirty && !this.conflict, (e) => e.child(this.button("edit-discard", null, "Discard", (cx) => this.reload(cx), t)))
+      .child(this.button("edit-save", null, "Save", (cx) => this.save(cx), t, dirty && !this.saving))
+      .child(this.button("edit-done", null, "Done", (cx) => this.leaveEdit(cx), t));
+  }
+
   render(cx) {
     const t = theme(), f = this.file();
     if (!f) return div().id("diff-view").size_full().p(20).bg(t.background).text_color(t.dim).child("Nothing to compare");
@@ -358,9 +461,11 @@ export default class DiffView extends View {
     if ((this.hx ?? 0) > this.maxHx()) this.hx = this.maxHx();
     const n = this.blocks?.length ?? 0, at = this.change;
     const empty = this.note ?? (this.rows ? null : "Loading…");
+    const editing = this.editing();
     return v_flex().id("diff-view").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_size_change((size, cx) => { if (Math.abs(size.width - this.width) > 1) { this.width = size.width; cx.notify(); } })
-      .on_mouse_down("left", () => this.handle.focus())
+      // Not while editing: the click is for the editor, which keeps the keyboard.
+      .on_mouse_down("left", () => { if (!this.editing()) this.handle.focus(); })
       // Dragging the line between the sides: the press is on the handle, the moves anywhere.
       .on_mouse_move((e, cx) => {
         if (!this.drag) return;
@@ -371,7 +476,15 @@ export default class DiffView extends View {
       .on_hover((hovered, cx) => { if (!hovered) this.endDrag(cx); })
       .on_key_down((e, cx) => {
         const k = e.key;
-        if (k === "n" || k === "j" || k === "down" && e.modifiers?.alt) this.step(1, cx);
+        // While editing, letters are typing: only save and Esc are ours.
+        if (this.editing()) {
+          if (k === "s" && (e.modifiers?.control || e.modifiers?.platform)) this.save(cx);
+          else if (k === "escape") this.leaveEdit(cx);
+          else return;
+          cx.stop_propagation(); return;
+        }
+        if (k === "e" && this.canEdit()) this.startEdit(cx);
+        else if (k === "n" || k === "j" || k === "down" && e.modifiers?.alt) this.step(1, cx);
         else if (k === "p" || k === "k" || k === "up" && e.modifiers?.alt) this.step(-1, cx);
         else if (k === "]") this.openFile(this.index + 1, cx);
         else if (k === "[") this.openFile(this.index - 1, cx);
@@ -380,7 +493,7 @@ export default class DiffView extends View {
         else if (k === "left") this.scrollX(-CHAR * 8, cx);
         else if (k === "right") this.scrollX(CHAR * 8, cx);
         else if (k === "home") this.scrollX(-1e9, cx);
-        else if (k === "escape" || k === "q") this.dismiss();
+        else if (k === "escape" || k === "q") this.dismiss(cx);
         else return;
         cx.stop_propagation();
       })
@@ -392,13 +505,16 @@ export default class DiffView extends View {
           .when(Boolean(this.stats && (this.stats.add || this.stats.del)), (e) => e
             .child(div().flex_none().text_size(12).text_color(t.ansi2).child(`+${this.stats.add}`))
             .child(div().flex_none().text_size(12).text_color(t.ansi1).child(`−${this.stats.del}`))))
+        .when(this.canEdit() && !editing, (e) => e.child(this.button("edit", "edit", "Edit", (cx) => this.startEdit(cx), t)))
         .when(this.files.length > 1, (e) => e.child(h_flex().flex_none().gap(2).items_center()
           .child(this.button("file-prev", "chevron-left", null, (cx) => this.openFile(this.index - 1, cx), t, this.index > 0))
           .child(div().text_size(12).text_color(t.muted).child(`${this.index + 1} / ${this.files.length} files`))
           .child(this.button("file-next", "chevron-right", null, (cx) => this.openFile(this.index + 1, cx), t, this.index < this.files.length - 1))))
-        .child(this.button("close", "close", null, () => this.dismiss(), t)))
+        .child(this.button("close", "close", null, (cx) => this.dismiss(cx), t)))
+      .when(editing, (e) => e.child(this.editBar(t)).child(div().flex_1().min_h(0)
+        .child(this.ed ? Editor.new(this.ed).size_full() : div().p(16).text_color(t.dim).child(this.editNote ?? "Opening…"))))
       // Which side is which, and the view controls.
-      .child(h_flex().h(36).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border).text_size(12)
+      .when(!editing, (e) => e.child(h_flex().h(36).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border).text_size(12)
         .child(h_flex().flex_1().min_w(0).gap(6).items_center()
           .child(div().px(6).h(20).flex().items_center().rounded(4).bg(t.ansi1 + "30").text_color(t.ansi1).child(f.leftLabel ?? "Before"))
           .child(div().text_color(t.dim).child("→"))
@@ -441,8 +557,9 @@ export default class DiffView extends View {
               cx.notify();
             })
             .child(div().w(this.drag ? 3 : 1).h_full().bg(this.drag ? t.accent : t.border).hover((st) => st.bg(t.accent)))))
-          .child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0())))
+          .child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0()))))
       .child(h_flex().h(24).flex_none().px(12).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
-        .child("n / p  next / previous change").child("[ / ]  previous / next file").child("f  full file").child("s  side by side / inline").child("shift+wheel / ← →  scroll sideways").child("drag the middle line to resize").child("Esc  close"));
+        .when(editing, (e) => e.child("ctrl+s  save").child("Esc  back to compare"))
+        .when(!editing, (e) => e.when(this.canEdit(), (e) => e.child("e  edit")).child("n / p  next / previous change").child("[ / ]  previous / next file").child("f  full file").child("s  side by side / inline").child("shift+wheel / ← →  scroll sideways").child("drag the middle line to resize").child("Esc  close")));
   }
 }

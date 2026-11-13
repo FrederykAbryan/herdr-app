@@ -531,13 +531,20 @@ export default class Changes extends View {
   }
 
   // Opens the file big, old and new side by side, with every listed file a step away.
-  compare(key, cx) {
+  // edit: opens it straight in the compare's editor.
+  compare(key, cx, edit = false) {
     if (!this.root) return;
     const files = [];
     for (const g of this.groups) for (const f of g.items) files.push({ key: `${g.id}|${f.path}`, path: f.path, status: f.status, ...this.sides(g.id, f) });
     const index = files.findIndex((f) => f.key === key);
     if (index < 0) return;
-    openOverlay({ mod: "diff-view", kind: "dialog", width: 0.94, height: 0.92, props: { root: this.root, on: this.on, files, index } });
+    openOverlay({ mod: "diff-view", kind: "dialog", width: 0.94, height: 0.92, props: { root: this.root, on: this.on, files, index, edit } });
+  }
+
+  // The compare can edit a file's working-tree copy on this computer (writeTextFile is local only).
+  canEdit(key) {
+    const { group, item } = this.item(key);
+    return Boolean(item && this.root && !this.on && this.sides(group, item).right === "worktree");
   }
 
   // Stage and unstage change the repo's index, as `git add` / `git restore --staged` would.
@@ -803,6 +810,10 @@ export default class Changes extends View {
             .rounded(5).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.compare(this.open, cx))
             .child(svg("mods/diff-view/split.svg").size(14)).child("Compare")))
+          .when(Boolean(this.open) && this.canEdit(this.open), (e) => e.child(h_flex().id("edit-open").h(22).px(7).gap(5).flex_none().items_center()
+            .rounded(5).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.compare(this.open, cx, true))
+            .child(svg("mods/diff-view/edit.svg").size(14)).child("Edit")))
           .child(div().id("preview-off").size(22).flex_none().flex().items_center().justify_center().rounded(5).text_color(t.muted).cursor_pointer()
             .hover((s) => s.bg(t.hover).text_color(t.foreground))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.setPreview(false, cx))
