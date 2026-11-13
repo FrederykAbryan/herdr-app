@@ -247,10 +247,21 @@ export default class DiffView extends View {
       keyword: t.ansi12, function: t.ansi11, type: t.ansi14, tag: t.ansi14, string: t.ansi3, number: t.ansi13,
       attr: t.ansi10, bracket: t.ansi13, comment: t.dim, punct: t.muted,
     };
-    return h_flex().flex_1().min_w(0).overflow_hidden().h_full().items_center().children(this.tokens(cell).map((tk) =>
-      div().flex_none().text_color(syntax[tk.kind] ?? t.foreground)
+    // Both sides scroll sideways together (this.hx); numbers and signs stay put.
+    return h_flex().flex_1().min_w(0).overflow_hidden().h_full().items_center().child(h_flex().flex_none().h_full().items_center().ml(-(this.hx ?? 0))
+      .children(this.tokens(cell).map((tk) => div().flex_none().text_color(syntax[tk.kind] ?? t.foreground)
         .when(tk.kind === "function", (e) => e.font_bold()).when(tk.kind === "comment" || tk.kind === "attr", (e) => e.italic())
-        .when(Boolean(tk.hl && color), (e) => e.rounded(3).bg(color + "80")).child(tk.text)));
+        .when(Boolean(tk.hl && color), (e) => e.rounded(3).bg(color + "80")).child(tk.text))));
+  }
+
+  // How far the code can scroll sideways: the longest line past the room one side gives it.
+  maxHx() {
+    const side = this.split ? Math.floor((this.width - 1) / 2) : this.width;
+    return Math.max(0, (this.longest ?? 0) * CHAR + 24 - (side - 63));
+  }
+  scrollX(by, cx) {
+    const next = Math.min(this.maxHx(), Math.max(0, (this.hx ?? 0) + by));
+    if (next !== this.hx) { this.hx = next; cx.notify(); }
   }
 
   // One side of a row: number, sign, code. kind: "same", "-", "+", or "gap" (nothing on this side).
@@ -302,7 +313,8 @@ export default class DiffView extends View {
     const t = theme(), f = this.file();
     if (!f) return div().id("diff-view").size_full().p(20).bg(t.background).text_color(t.dim).child("Nothing to compare");
     const parts = f.path.split("/"), name = parts.pop(), lines = this.lines();
-    const half = Math.max(this.width / 2 - 8, this.longest ? (this.longest + 1) * CHAR + 70 : 0);
+    const half = Math.floor((this.width - 1) / 2);
+    if ((this.hx ?? 0) > this.maxHx()) this.hx = this.maxHx();
     const n = this.blocks?.length ?? 0, at = this.change;
     const empty = this.note ?? (this.rows ? null : "Loading…");
     return v_flex().id("diff-view").size_full().min_h(0).bg(t.background).text_color(t.foreground).text_size(13).track_focus(this.handle)
@@ -316,6 +328,9 @@ export default class DiffView extends View {
         else if (k === "[") this.openFile(this.index - 1, cx);
         else if (k === "f") this.setFull(!this.full, cx);
         else if (k === "s") this.setSplit(!this.split, cx);
+        else if (k === "left") this.scrollX(-CHAR * 8, cx);
+        else if (k === "right") this.scrollX(CHAR * 8, cx);
+        else if (k === "home") this.scrollX(-1e9, cx);
         else if (k === "escape" || k === "q") this.dismiss();
         else return;
         cx.stop_propagation();
@@ -342,7 +357,7 @@ export default class DiffView extends View {
           .when(this.loading && Boolean(this.rows), (e) => e.child(div().text_color(t.dim).child("updating…"))))
         .child(h_flex().flex_none().gap(2).items_center()
           .child(this.button("change-prev", "arrow-up", null, (cx) => this.step(-1, cx), t, n > 0 && at > 0))
-          .child(div().w(76).text_center().text_color(t.muted).child(n ? `${Math.max(1, at + 1)} of ${n} change${n === 1 ? "" : "s"}` : "no changes"))
+          .child(div().w(104).text_center().whitespace_nowrap().text_color(t.muted).child(n ? `${Math.max(1, at + 1)} of ${n} change${n === 1 ? "" : "s"}` : "no changes"))
           .child(this.button("change-next", "arrow-down", null, (cx) => this.step(1, cx), t, n > 0 && at < n - 1)))
         .child(h_flex().p(2).gap(2).rounded(7).border_1().border_color(t.border)
           .child(this.pill("only-changes", "Changes", !this.full, (cx) => this.setFull(false, cx), t))
@@ -355,8 +370,12 @@ export default class DiffView extends View {
         .when(!empty, (e) => e
           // Changes only: a plain list (few rows), so a change can be scrolled to. Full file: a
           // virtual list, drawn a screen at a time.
-          .child(div().id("diff-x").size_full().overflow_x_scrollbar()
-            .child(div().min_w(half * 2 + 1).w_full().h_full().relative()
+          .child(div().id("diff-x").size_full().overflow_hidden()
+            .on_scroll_wheel((e, cx) => {
+              const dx = Math.abs(e.delta?.x ?? 0) > Math.abs(e.delta?.y ?? 0) ? e.delta.x : e.modifiers?.shift ? e.delta?.y ?? 0 : 0;
+              if (dx) { this.scrollX(-dx, cx); cx.stop_propagation(); }
+            })
+            .child(div().w_full().h_full().relative()
               .when(!this.full, (e) => e.child(v_flex().id("diff-plain").absolute().inset_0().overflow_y_scroll().track_scroll(this.scroll)
                 .children(lines.map((it) => this.line(it, half, t)))))
               .when(this.full, (e) => e.child(v_virtual_list("diff-rows", lines.length, ROW, (i) => String(i),
@@ -364,6 +383,6 @@ export default class DiffView extends View {
           .when(!this.full, (e) => e.child(Scrollbar.vertical("diff-plain").absolute().inset_0()))
           .when(this.full, (e) => e.child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0()))))
       .child(h_flex().h(24).flex_none().px(12).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
-        .child("n / p  next / previous change").child("[ / ]  previous / next file").child("f  full file").child("s  side by side / inline").child("Esc  close"));
+        .child("n / p  next / previous change").child("[ / ]  previous / next file").child("f  full file").child("s  side by side / inline").child("shift+wheel / ← →  scroll sideways").child("Esc  close"));
   }
 }
