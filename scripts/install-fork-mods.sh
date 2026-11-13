@@ -7,6 +7,7 @@
 #   tabs      -> tabs-plus       Tab bar: grid layouts and full screen
 #   pane-grid -> pane-grid       the grid menu (new)
 #   diff-view -> diff-view       side-by-side compare, opened from the Changes panel (new)
+#   workspace-status -> workspace-status-plus   status bar: click the branch to switch / create one
 #
 # and a layout `main-focus` (a clone of `main`) that uses them. Your own layout stays as it
 # was: switch with ctrl-shift-l. Personal mods are never overwritten by app updates.
@@ -41,14 +42,17 @@ cp "$src/pane-grid/main.js" "$src/pane-grid/mod.json" "$home/mods/pane-grid/"
 mkdir -p "$home/mods/diff-view"
 cp "$src"/diff-view/* "$home/mods/diff-view/"
 
-for m in changes-focus agents-view tabs-plus pane-grid diff-view; do herdr-app check "$home/mods/$m"; done
+clone workspace-status workspace-status-plus
+sed 's|^const SELF = "workspace-status";|const SELF = "workspace-status-plus";|' "$src/workspace-status/main.js" > "$home/mods/workspace-status-plus/main.js"
+
+for m in changes-focus agents-view tabs-plus pane-grid diff-view workspace-status-plus; do herdr-app check "$home/mods/$m"; done
 
 # The layout: clone main once, then point its blocks at the personal mods.
 [ -f "$home/layouts/main-focus.json" ] || herdr-app do layout.clone '{"name":"main","as":"main-focus"}' >/dev/null
 python3 -I - "$home/layouts/main-focus.json" <<'EOF'
 import json, sys
 path = sys.argv[1]
-swap = {"changes": "changes-focus", "agents": "agents-view", "tabs": "tabs-plus"}
+swap = {"changes": "changes-focus", "agents": "agents-view", "tabs": "tabs-plus", "workspace-status": "workspace-status-plus"}
 layout = json.load(open(path))
 def walk(node):
     if isinstance(node, dict):
