@@ -15,6 +15,17 @@ const CONTEXT = 3, ROW = 20, CHAR = 7.6;
 // long to draw each frame, so they go in a virtual list (a screen at a time, no jumping).
 const PLAIN_MAX = 500;
 
+// The terminal palette (Monokai-like syntax, solid diff rows) and how keywords split up.
+const VIVID = {
+  syntax: { keyword: "#66d9ef", control: "#f92672", literal: "#ae81ff", function: "#a6e22e", type: "#66d9ef", tag: "#f92672",
+    string: "#e6db74", number: "#ae81ff", attr: "#fd971f", bracket: "#f8f8f2", comment: "#8a8a80", punct: "#f8f8f2" },
+  text: "#f8f8f2", add: "#0f4a14", del: "#5a1212", addCur: "#16661d", delCur: "#7d1818",
+  addWord: "#2f9a3a", delWord: "#b42e2e", addSign: "#7ee787", delSign: "#ff8a80", number: "#75756e", changedNumber: "#e8e8e3",
+};
+const CONTROL = new Set(`if else for while do switch case default break continue return throw try catch finally await yield new delete
+  in of instanceof typeof match loop when elif except raise pass with then fi esac done`.split(/\s+/));
+const LITERAL = new Set("true false null undefined this self Self super None True False nil none".split(" "));
+
 // Both sides into temp files, then git's own diff with the whole file as context.
 const DIFF = `
 root=$1; left=$2; right=$3; path=$4
@@ -256,16 +267,28 @@ export default class DiffView extends View {
     return cell.tokens;
   }
 
-  code(cell, color, t) {
-    const syntax = {
-      keyword: t.ansi12, function: t.ansi11, type: t.ansi14, tag: t.ansi14, string: t.ansi3, number: t.ansi13,
-      attr: t.ansi10, bracket: t.ansi13, comment: t.dim, punct: t.muted,
+  // Terminal look (dark appearance): vivid syntax colors on solid green and red rows, like a
+  // diff printed in a terminal. Light appearance keeps the theme's colors.
+  look(t) {
+    if (settings().dark === false) return {
+      syntax: { keyword: t.ansi12, control: t.ansi12, literal: t.ansi13, function: t.ansi11, type: t.ansi14, tag: t.ansi14, string: t.ansi3,
+        number: t.ansi13, attr: t.ansi10, bracket: t.ansi13, comment: t.dim, punct: t.muted },
+      text: t.foreground, add: t.ansi2 + "30", del: t.ansi1 + "30", addCur: t.ansi2 + "5c", delCur: t.ansi1 + "5c",
+      addWord: t.ansi2 + "80", delWord: t.ansi1 + "80", addSign: t.ansi2, delSign: t.ansi1, number: t.dim, changedNumber: t.foreground,
     };
+    return VIVID;
+  }
+
+  code(cell, kind, v) {
+    const word = kind === "+" ? v.addWord : kind === "-" ? v.delWord : null;
     // Both sides scroll sideways together (this.hx); numbers and signs stay put.
     return h_flex().flex_1().min_w(0).overflow_hidden().h_full().items_center().child(h_flex().flex_none().h_full().items_center().ml(-(this.hx ?? 0))
-      .children(this.tokens(cell).map((tk) => div().flex_none().text_color(syntax[tk.kind] ?? t.foreground)
-        .when(tk.kind === "function", (e) => e.font_bold()).when(tk.kind === "comment" || tk.kind === "attr", (e) => e.italic())
-        .when(Boolean(tk.hl && color), (e) => e.rounded(3).bg(color + "80")).child(tk.text))));
+      .children(this.tokens(cell).map((tk) => {
+        const k = tk.kind === "keyword" ? (CONTROL.has(tk.text) ? "control" : LITERAL.has(tk.text) ? "literal" : "keyword") : tk.kind;
+        return div().flex_none().text_color(v.syntax[k] ?? v.text)
+          .when(k === "comment" || k === "attr", (e) => e.italic())
+          .when(Boolean(tk.hl && word), (e) => e.bg(word)).child(tk.text);
+      })));
   }
 
   // How far the code can scroll sideways: the longest line past the room one side gives it.
@@ -282,17 +305,18 @@ export default class DiffView extends View {
     if (next !== this.hx) { this.hx = next; cx.notify(); }
   }
 
-  // One side of a row: number, sign, code. kind: "same", "-", "+", or "gap" (nothing on this side).
-  // cur: this row belongs to the change the counter is on: a stronger tint and an accent edge.
+  // One side of a row: number and sign together, then code. kind: "same", "-", "+", or "gap"
+  // (nothing on this side). cur: the change the counter is on: brighter rows and an accent edge.
   half(cell, kind, width, t, cur = false) {
-    const color = kind === "+" ? t.ansi2 : kind === "-" ? t.ansi1 : null;
-    const el = h_flex().h_full().flex_none().w(width).items_center().overflow_hidden();
-    if (kind === "gap") return el.bg(cur ? t.accent + "1c" : t.raised + "60").child(div().w(3).h_full().flex_none().when(cur, (e) => e.bg(t.accent)));
-    return el.when(Boolean(color), (e) => e.bg(color + (cur ? "5c" : "26")))
-      .child(div().w(3).h_full().flex_none().when(Boolean(color), (e) => e.bg(cur ? t.accent : color)))
-      .child(div().w(46).h_full().flex_none().pr(8).flex().items_center().justify_end().text_color(color ?? t.dim).child(String(cell.n)))
-      .child(div().w(14).flex_none().font_semibold().text_color(color ?? t.dim).child(kind === "+" ? "+" : kind === "-" ? "−" : ""))
-      .child(this.code(cell, color, t));
+    const v = this.look(t), changed = kind === "+" || kind === "-";
+    const bg = kind === "+" ? (cur ? v.addCur : v.add) : kind === "-" ? (cur ? v.delCur : v.del) : null;
+    const el = h_flex().h_full().flex_none().w(width).items_center().overflow_hidden()
+      .child(div().w(3).h_full().flex_none().when(cur, (e) => e.bg(t.accent)));
+    if (kind === "gap") return el.bg(cur ? t.accent + "1c" : t.raised + "50");
+    return el.when(Boolean(bg), (e) => e.bg(bg))
+      .child(div().w(40).h_full().flex_none().pr(4).flex().items_center().justify_end().text_color(changed ? v.changedNumber : v.number).child(String(cell.n)))
+      .child(div().w(16).flex_none().text_color(kind === "+" ? v.addSign : kind === "-" ? v.delSign : v.number).child(kind === "+" ? "+" : kind === "-" ? "-" : ""))
+      .child(this.code(cell, kind, v));
   }
 
   line(it, [lw, rw], t) {
