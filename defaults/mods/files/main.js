@@ -226,7 +226,7 @@ export default class Files extends View {
 
   // A row's icon: a folder (open or shut), the file type's badge or glyph, else a plain page.
   icon(entry, open, t) {
-    return entry.dir ? folderIcon(FT, open) : typeIcon(FT, entry.name, t);
+    return entry.dir ? folderIcon(FT, open, entry.name) : typeIcon(FT, entry.name, t);
   }
 
   rows(prefix, depth, out, t) {

@@ -10,7 +10,7 @@
 #   git-graph -> git-graph       commit graph, opened from the Changes panel (new)
 #   workspace-status -> workspace-status-plus   status bar: click the branch to switch / create one
 #   spaces    -> spaces-plus     Spaces sidebar: groups (fold, drag in, right-click to move)
-#   files     -> files-plus      Files panel: file-type icons, colorful previews (.env too), Edit / Save
+#   files     -> files-plus      Files panel: Material file/folder icons, colorful previews (.env too), Edit / Save
 #   menu      -> menu-plus       space menu with Move to group / New group, the group menu
 #
 # and a layout `main-focus` (a clone of `main`) that uses them. Your own layout stays as it
@@ -31,7 +31,7 @@ clone() {
 
 clone changes changes-focus
 sed -e 's|^const ICONS = "mods/changes";|const ICONS = "mods/changes-focus";|' -e 's|^const FT = "mods/files";|const FT = "mods/files-plus";|' "$src/changes/main.js" > "$home/mods/changes-focus/main.js"
-cp "$src/changes/filetypes.js" "$home/mods/changes-focus/"
+cp "$src/changes/filetypes.js" "$src/changes/icon-map.js" "$home/mods/changes-focus/"
 cp "$src"/changes/scm-*.svg "$src/changes/CODICONS-LICENSE" "$home/mods/changes-focus/"
 
 clone agents agents-view
@@ -58,7 +58,9 @@ sed 's|^const MENU = "menu";|const MENU = "menu-plus";|' "$src/spaces/main.js" >
 
 clone files files-plus
 sed -e 's|mods/files/|mods/files-plus/|g' -e 's|^const FT = "mods/files";|const FT = "mods/files-plus";|' "$src/files/main.js" > "$home/mods/files-plus/main.js"
-cp "$src"/files/*.svg "$src/files/filetypes.js" "$home/mods/files-plus/"
+cp "$src"/files/*.svg "$src/files/filetypes.js" "$src/files/icon-map.js" "$home/mods/files-plus/"
+rm -rf "$home/mods/files-plus/mi" "$home/mods/files-plus"/ft-*.svg
+cp -r "$src/files/mi" "$home/mods/files-plus/"
 
 clone menu menu-plus
 sed 's|^const SELF = "menu";|const SELF = "menu-plus";|' "$src/menu/main.js" > "$home/mods/menu-plus/main.js"

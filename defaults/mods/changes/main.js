@@ -110,7 +110,7 @@ function diffRows(lines) {
 
 // Icons: Codicons (see CODICONS-LICENSE), tinted with the theme.
 const ICONS = "mods/changes";
-// File-type glyphs: the Files panel's ft-*.svg (shared look, see filetypes.js).
+// File and folder icons: the Files panel's mi/*.svg (Material Icon Theme, see filetypes.js).
 const FT = "mods/files";
 const icon = (name, size = 14) => svg(`${ICONS}/scm-${name}.svg`).size(size).flex_none();
 // git's letters as editors show them: U untracked, C conflict.
@@ -734,7 +734,7 @@ export default class Changes extends View {
     return this.hoverable(h_flex().id(id).h(24).flex_none().pl(20 + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => this.toggle(this.collapsed, key, cx))
       .child(icon(open ? "chevron-down" : "chevron-right", 16).text_color(t.muted))
-      .child(folderIcon(FT, open))
+      .child(folderIcon(FT, open, name))
       .child(div().flex_1().min_w(0).truncate().child(name))
       .when(Boolean(action), (e) => e.child(action))
       .child(div().size(6).mx(4).flex_none().rounded(3).bg(t.dim)), id);
