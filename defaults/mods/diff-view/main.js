@@ -1,5 +1,5 @@
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, ScrollHandle, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, Scrollbar, VirtualListScrollHandle, v_virtual_list } from "gpui-base";
 import { exec, theme, settings, props, closeOverlay } from "herdr";
 
 // Compare a changed file with how it was before, side by side (or inline), as a dialog over the
@@ -11,9 +11,6 @@ import { exec, theme, settings, props, closeOverlay } from "herdr";
 const SELF = "mods/diff-view";
 const icon = (name, size = 16) => svg(`${SELF}/${name}.svg`).size(size).flex_none();
 const CONTEXT = 3, ROW = 20, CHAR = 7.6;
-// Up to this many lines draw as a plain list, which can scroll to a change; more would take too
-// long to draw each frame, so they go in a virtual list (a screen at a time, no jumping).
-const PLAIN_MAX = 500;
 
 // The terminal palette: GitHub's dark syntax colors, made to read on green and red diff rows,
 // on solid rows a little stronger than GitHub's; changed words a step brighter than their row.
@@ -145,7 +142,7 @@ export default class DiffView extends View {
     const p = props() ?? {};
     this.files = p.files ?? []; this.index = Math.min(Math.max(0, p.index ?? 0), Math.max(0, this.files.length - 1));
     this.root = p.root; this.on = p.on ?? null;
-    this.handle = cx.focus_handle(); this.scroll = ScrollHandle.new();
+    this.handle = cx.focus_handle(); this.scroll = VirtualListScrollHandle.new();
     try { this.split = localStorage.getItem("split") !== "inline"; } catch { this.split = true; }
     try { this.full = localStorage.getItem("full") === "full"; } catch { this.full = false; }
     this.width = 1200; this.change = -1;
@@ -174,7 +171,8 @@ export default class DiffView extends View {
         const d = parse(r.stdout);
         this.lang = langOf(f.path); this.note = d.note ?? null; this.rows = d.rows ?? []; this.stats = { add: d.add ?? 0, del: d.del ?? 0 };
         this.same = Boolean(d.same);
-        this.longest = Math.max(20, ...this.rows.map((row) => Math.max(row.l?.text.length ?? 0, row.r?.text.length ?? 0)));
+        // A loop, not Math.max(...rows): a spread of a huge file's rows overflows the stack.
+        this.longest = this.rows.reduce((m, row) => Math.max(m, row.l?.text.length ?? 0, row.r?.text.length ?? 0), 20);
         this.build();
         if (first && this.blocks.length) { this.change = 0; this.jump(cx); }
         else if (this.change >= this.blocks.length) this.change = this.blocks.length - 1;
@@ -201,10 +199,8 @@ export default class DiffView extends View {
       let j = i; while (j < rows.length && !keep[j] && !this.expanded.has(j)) j++;
       items.push({ fold: i, count: j - i, end: j }); i = j;
     }
-    this.items = items; this.blocks = blocks;
+    this.items = items; this.blocks = blocks; this.drawn = null;
   }
-
-  plain() { return !this.full && this.lines().length <= PLAIN_MAX; }
 
   endDrag(cx) {
     if (!this.drag) return;
@@ -233,15 +229,13 @@ export default class DiffView extends View {
     return n;
   }
   jump(cx) {
-    if (!this.plain() || this.change < 0 || !this.blocks?.length) return;
+    if (this.change < 0 || !this.blocks?.length) return;
     // A little room above the change, like an editor's reveal.
-    this.scroll.scroll_to_item(Math.max(0, this.lineOf(this.blocks[this.change]) - 3));
+    this.scroll.scroll_to_item(Math.max(0, this.lineOf(this.blocks[this.change]) - 3), "top");
     cx.notify();
   }
   step(by, cx) {
     if (!this.blocks?.length) return;
-    // Stepping through changes is the Changes view's job: the full file can't be scrolled to one.
-    if (this.full) this.setFull(false, cx);
     this.change = Math.min(this.blocks.length - 1, Math.max(0, (this.change < 0 ? (by > 0 ? -1 : 0) : this.change) + by));
     this.jump(cx);
   }
@@ -251,13 +245,16 @@ export default class DiffView extends View {
   }
 
   // Lines as the list draws them. Split: one per row. Inline: a change row becomes its − then its +.
+  // Kept until the items or the split change: render asks for it on every redraw.
   lines() {
+    if (this.drawn?.items === this.items && this.drawn.split === this.split) return this.drawn.out;
     const out = [];
     for (const it of this.items ?? []) {
       if (it.fold !== undefined || this.split || it.row.kind === "same") { out.push(it); continue; }
       if (it.row.l) out.push({ side: "l", row: it.row, block: it.block });
       if (it.row.r) out.push({ side: "r", row: it.row, block: it.block });
     }
+    this.drawn = { items: this.items, split: this.split, out };
     return out;
   }
 
@@ -320,12 +317,12 @@ export default class DiffView extends View {
       .child(this.code(cell, kind, v));
   }
 
+  // Drawn by the virtual list, which refuses per-row handlers: a fold's click is the list's
+  // on_item_click.
   line(it, [lw, rw], t) {
     if (it.fold !== undefined) {
       return h_flex().id(`fold-${it.fold}`).w_full().h(ROW).flex_none().px(12).gap(8).items_center().cursor_pointer()
-        .bg(t.accent + "14").text_color(t.accent).hover((s) => s.bg(t.accent + "26"))
-        .on_click((_e, cx) => this.unfold(it, cx))
-        .child(icon("unfold", 14)).child(`${it.count} unchanged line${it.count === 1 ? "" : "s"}`);
+        .bg(t.accent + "14").text_color(t.accent).hover((s) => s.bg(t.accent + "26"))        .child(icon("unfold", 14)).child(`${it.count} unchanged line${it.count === 1 ? "" : "s"}`);
     }
     const { row } = it, cur = it.block !== undefined && it.block >= 0 && it.block === this.change;
     if (!this.split) {
@@ -357,7 +354,7 @@ export default class DiffView extends View {
     const t = theme(), f = this.file();
     if (!f) return div().id("diff-view").size_full().p(20).bg(t.background).text_color(t.dim).child("Nothing to compare");
     const parts = f.path.split("/"), name = parts.pop(), lines = this.lines();
-    const widths = this.sides(), plain = !this.full && lines.length <= PLAIN_MAX;
+    const widths = this.sides();
     if ((this.hx ?? 0) > this.maxHx()) this.hx = this.maxHx();
     const n = this.blocks?.length ?? 0, at = this.change;
     const empty = this.note ?? (this.rows ? null : "Loading…");
@@ -412,7 +409,7 @@ export default class DiffView extends View {
           .child(div().id("change-count").w(104).h(24).flex().items_center().justify_center().rounded(5).whitespace_nowrap()
             .when(n > 0, (e) => e.cursor_pointer().hover((st) => st.bg(t.hover)))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-            .on_click((_e, cx) => { if (!n) return; if (this.full) this.setFull(false, cx); this.change = (at + 1) % n; this.jump(cx); }).text_color(t.muted).child(n ? `${Math.max(1, at + 1)} of ${n} change${n === 1 ? "" : "s"}` : "no changes"))
+            .on_click((_e, cx) => { if (!n) return; this.change = (at + 1) % n; this.jump(cx); }).text_color(t.muted).child(n ? `${Math.max(1, at + 1)} of ${n} change${n === 1 ? "" : "s"}` : "no changes"))
           .child(this.button("change-next", "arrow-down", null, (cx) => this.step(1, cx), t, n > 0 && at < n - 1)))
         .child(h_flex().p(2).gap(2).rounded(7).border_1().border_color(t.border)
           .child(this.pill("only-changes", "Changes", !this.full, (cx) => this.setFull(false, cx), t))
@@ -423,18 +420,18 @@ export default class DiffView extends View {
       .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12.5)
         .when(Boolean(empty), (e) => e.child(div().p(16).text_color(t.dim).child(empty)))
         .when(!empty, (e) => e
-          // Changes only: a plain list (few rows), so a change can be scrolled to. Full file: a
-          // virtual list, drawn a screen at a time.
+          // Always a virtual list, drawn a screen at a time: a plain list rebuilt every row on every
+          // redraw and ran past the mod's time limit ("could not be re-rendered") on big diffs.
           .child(div().id("diff-x").size_full().overflow_hidden()
             .on_scroll_wheel((e, cx) => {
               const dx = Math.abs(e.delta?.x ?? 0) > Math.abs(e.delta?.y ?? 0) ? e.delta.x : e.modifiers?.shift ? e.delta?.y ?? 0 : 0;
               if (dx) { this.scrollX(-dx, cx); cx.stop_propagation(); }
             })
             .child(div().w_full().h_full().relative()
-              .when(plain, (e) => e.child(v_flex().id("diff-plain").absolute().inset_0().overflow_y_scroll().track_scroll(this.scroll)
-                .children(lines.map((it) => this.line(it, widths, t)))))
-              .when(!plain, (e) => e.child(v_virtual_list("diff-rows", lines.length, ROW, (i) => String(i),
-                (range) => lines.slice(range.start, range.end).map((it) => this.line(it, widths, t))).size_full()))))
+              .child(v_virtual_list("diff-rows", lines.length, ROW, (i) => String(i),
+                (range) => lines.slice(range.start, range.end).map((it) => this.line(it, widths, t))).size_full()
+                .track_scroll(this.scroll)
+                .on_item_click((key, cx) => { const it = this.lines()[Number(key)]; if (it?.fold !== undefined) this.unfold(it, cx); }))))
           .when(this.split, (e) => e.child(div().id("divider").absolute().top(0).bottom(0).left(widths[0] - 3).w(7).cursor_col_resize()
             .flex().justify_center()
             .on_mouse_down("left", (ev, cx) => {
@@ -444,8 +441,7 @@ export default class DiffView extends View {
               cx.notify();
             })
             .child(div().w(this.drag ? 3 : 1).h_full().bg(this.drag ? t.accent : t.border).hover((st) => st.bg(t.accent)))))
-          .when(plain, (e) => e.child(Scrollbar.vertical("diff-plain").absolute().inset_0()))
-          .when(!plain, (e) => e.child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0()))))
+          .child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0())))
       .child(h_flex().h(24).flex_none().px(12).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
         .child("n / p  next / previous change").child("[ / ]  previous / next file").child("f  full file").child("s  side by side / inline").child("shift+wheel / ← →  scroll sideways").child("drag the middle line to resize").child("Esc  close"));
   }
