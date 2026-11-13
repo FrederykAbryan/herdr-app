@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
+import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, settings } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -9,6 +9,26 @@ function find(node, id) {
     if (found) return found;
   }
   return null;
+}
+
+// Full screen: the panes take the whole window. Hides the sidebar, side panel and status bar
+// and maximizes the window, remembering which were shown (shared, so it survives a restart)
+// to put back exactly that.
+const FULL = "workspace.fullscreen";
+const CHROME = ["sidebar", "panel", "status"];
+function toggleFullscreen() {
+  const root = layout(), was = shared(FULL);
+  if (!was) {
+    const saved = Object.fromEntries(CHROME.map((id) => [id, Boolean(find(root, id)) && !find(root, id).hidden]));
+    saved.maximized = Boolean(window()?.maximized);
+    setShared(FULL, saved);
+    for (const id of CHROME) if (saved[id]) run("layout.hide", { id });
+    if (!saved.maximized) run("window.maximize");
+  } else {
+    setShared(FULL, null);
+    for (const id of CHROME) if (was[id]) run("layout.show", { id });
+    if (!was.maximized && window()?.maximized) run("window.maximize");
+  }
 }
 
 export default class Tabs extends View {
@@ -21,7 +41,8 @@ export default class Tabs extends View {
   // The side panel is remembered per space: switching shows that space's choice
   // (closed if it never had one), and opening or closing it records it.
   syncPanel(space, panel, body, enabled) {
-    if (!space || !panel) return;
+    // In full screen a space switch doesn't bring the panel back; a click on Files or Changes still does.
+    if (!space || !panel || shared(FULL)) return;
     const now = panel.hidden ? null : body?.active ?? null;
     if (space.id !== this.space) {
       const first = this.space === undefined;
@@ -106,6 +127,9 @@ export default class Tabs extends View {
         .on_size_change((_size, cx) => { if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
         .children(shown.map(item)))
       .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
+      .child(button("pane-grid", svg("mods/tabs/scm-layout.svg").size(15), () => openOverlay({ mod: "pane-grid", kind: "popup", width: 392, height: 360 })).tooltip("Split into a grid"))
+      .child(button("fullscreen", svg(`mods/tabs/scm-screen-${shared(FULL) ? "normal" : "full"}.svg`).size(15), toggleFullscreen)
+        .when(Boolean(shared(FULL)), (e) => e.bg(t.selected).text_color(t.foreground)).tooltip(shared(FULL) ? "Leave full screen" : "Full screen"))
       .when(enabled.includes("files"), el => el.child(panelButton("files", "Files", "mods/files/file.svg")))
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", "Changes", "mods/changes/changes.svg")))
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs/win-min.svg").size(16) : "−", () => run("window.minimize")))
