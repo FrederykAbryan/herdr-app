@@ -243,6 +243,7 @@ export default class Changes extends View {
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
+    cx.timer.every(3000, (cx) => this.attribute(cx));
   }
 
   group(id) { return this.groups.find((g) => g.id === id)?.items ?? []; }
@@ -251,10 +252,12 @@ export default class Changes extends View {
     return { group, path, item: this.group(group).find((f) => f.path === path) };
   }
 
-  // The agent whose changes Session mode shows: the focused pane's, else the tab's most recent.
+  // The agent whose changes Session mode shows: the focused terminal's. A plain terminal has
+  // none of its own and doesn't borrow a neighbour's; only when no terminal has the focus
+  // (a mod pane) does the tab's most recent agent stand in.
   session() {
     const f = focused(), saved = shared(SESSIONS) ?? {};
-    const tab = agents().filter((a) => a.tab === f?.tab).sort((a, b) => b.seq - a.seq).map((a) => a.address);
+    const tab = f?.terminal ? [] : agents().filter((a) => a.tab === f?.tab).sort((a, b) => b.seq - a.seq).map((a) => a.address);
     for (const address of [f?.terminal, f?.agent, ...tab]) if (address && saved[address]) return { address, ...saved[address] };
     return null;
   }
@@ -315,7 +318,9 @@ export default class Changes extends View {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: pane.cwd, on });
         const root = top.code === 0 ? top.stdout.trim() : null;
-        value = { root, on, tree: root ? await this.snapshot(root, on) : null, live: true, at: Date.now() };
+        const tree = root ? await this.snapshot(root, on) : null;
+        const head = root ? await exec("git", ["rev-parse", "-q", "--verify", "HEAD"], { cwd: root, on }) : null;
+        value = { root, on, tree, head: head?.code === 0 ? head.stdout.trim() : null, paths: [], live: true, at: Date.now() };
       } catch (e) { value = { root: null, on, tree: null, live: true, at: Date.now(), error: String(e) }; }
       finally { this.pending.delete(address); }
       this.saveSession(address, value);
@@ -327,13 +332,67 @@ export default class Changes extends View {
   // (kept a few days so a finished session can still be reviewed; it starts over if it returns).
   trackSessions(cx) {
     const live = agents(), saved = shared(SESSIONS) ?? {};
-    for (const a of live) if (!saved[a.address]?.live && !this.pending.has(a.address)) this.baseline(a, cx);
+    // A live session saved before files were credited per agent (no paths) starts over once.
+    for (const a of live) if ((!saved[a.address]?.live || !Array.isArray(saved[a.address].paths)) && !this.pending.has(a.address)) this.baseline(a, cx);
     const gone = Object.keys(saved).filter((a) => saved[a].live && !live.some((x) => x.address === a));
     if (gone.length) cx.spawn(async (cx) => {
       const next = { ...(shared(SESSIONS) ?? {}) };
       for (const a of gone) if (next[a]?.live && !agents().some((x) => x.address === a)) next[a] = { ...next[a], live: false, ended: Date.now() };
       setShared(SESSIONS, next);
       cx.notify();
+    });
+  }
+
+  // Which files each agent changed. Every few seconds, each repo with a tracked agent is
+  // snapshotted; the files that changed since the last look go to the agents in it that were
+  // working or blocked (now or at the last look). With none working they go to the repo's only
+  // agent if it has just one, else to nobody: another agent's work, or your own edits, don't
+  // show up in a session that didn't make them.
+  attribute(cx) {
+    // Also from here, not only render: a hidden panel keeps its timers but isn't drawn.
+    this.trackSessions(cx);
+    if (this.attributing) return;
+    const saved = shared(SESSIONS) ?? {}, repos = new Map();
+    for (const a of agents()) {
+      const s = saved[a.address];
+      if (!s?.live || !s.root || !s.tree || !Array.isArray(s.paths)) continue;
+      const k = `${s.on ?? ""}:${s.root}`;
+      if (!repos.has(k)) repos.set(k, { root: s.root, on: s.on, agents: [] });
+      repos.get(k).agents.push({ address: a.address, busy: a.status === "working" || a.status === "blocked" });
+    }
+    this.last ??= {};
+    for (const k of Object.keys(this.last)) if (!repos.has(k)) delete this.last[k];
+    if (!repos.size) return;
+    this.attributing = true;
+    cx.spawn(async (cx) => {
+      const credit = {};
+      try {
+        for (const [k, repo] of repos) {
+          const prev = this.last[k];
+          const now = await this.snapshot(repo.root, repo.on).catch(() => null);
+          if (!now) continue;
+          const busy = new Set(repo.agents.filter((a) => a.busy).map((a) => a.address));
+          this.last[k] = { tree: now, busy };
+          if (!prev || prev.tree === now) continue;
+          const r = await exec("git", [...READ, "diff", "--name-only", "-z", "--no-renames", prev.tree, now], { cwd: repo.root, on: repo.on });
+          const paths = r.code === 0 ? r.stdout.split("\0").filter(Boolean) : [];
+          if (!paths.length) continue;
+          let to = repo.agents.filter((a) => busy.has(a.address) || prev.busy.has(a.address)).map((a) => a.address);
+          if (!to.length && repo.agents.length === 1) to = [repo.agents[0].address];
+          for (const a of to) { credit[a] ??= new Set(); for (const p of paths) credit[a].add(p); }
+        }
+        if (Object.keys(credit).length) {
+          const next = { ...(shared(SESSIONS) ?? {}) };
+          for (const [a, paths] of Object.entries(credit)) {
+            if (!next[a]?.live || !Array.isArray(next[a].paths)) continue;
+            const had = new Set(next[a].paths), size = had.size;
+            for (const p of paths) had.add(p);
+            if (had.size !== size) next[a] = { ...next[a], paths: [...had] };
+          }
+          setShared(SESSIONS, next);
+        }
+      } finally { this.attributing = false; }
+      if (Object.keys(credit).length) { this.refresh(cx); cx.notify(); }
     });
   }
 
@@ -362,7 +421,11 @@ export default class Changes extends View {
     if (!s?.root || this.busy) return;
     this.busy = true;
     cx.spawn(async (cx) => {
-      try { this.saveSession(s.address, { ...record(s), tree: await this.snapshot(s.root, s.on), at: Date.now(), error: undefined }); }
+      try {
+        const tree = await this.snapshot(s.root, s.on);
+        const head = await exec("git", ["rev-parse", "-q", "--verify", "HEAD"], { cwd: s.root, on: s.on });
+        this.saveSession(s.address, { ...record(s), tree, head: head.code === 0 ? head.stdout.trim() : null, paths: [], at: Date.now(), error: undefined });
+      }
       catch (e) { this.note = `Could not snapshot: ${e}`; }
       finally { this.busy = false; this.refresh(cx); cx.notify(); }
     });
@@ -412,8 +475,20 @@ export default class Changes extends View {
             const nums = await git(["diff", "--numstat", "-z", "--no-renames", s.tree, now]);
             for (const r of [names, nums]) if (r.code !== 0) throw new Error(r.stderr);
             const stats = parseNumstat(nums.stdout), mine = new Map(), parts = names.stdout.split("\0");
-            for (let i = 0; i + 1 < parts.length; i += 2) if (parts[i] && parts[i + 1]) mine.set(parts[i + 1], LETTER[parts[i][0]] ?? "M");
+            // Only the files this agent touched (see attribute); sessions saved before that was
+            // tracked have no list and keep every change since their snapshot.
+            const touched = Array.isArray(s.paths) ? new Set(s.paths) : null;
+            for (let i = 0; i + 1 < parts.length; i += 2) if (parts[i] && parts[i + 1] && (!touched || touched.has(parts[i + 1]))) mine.set(parts[i + 1], LETTER[parts[i][0]] ?? "M");
             const listed = new Set([...staged, ...changes].map((f) => f.path));
+            // Committed: a session file git no longer lists that a commit since the snapshot changed.
+            // One that is clean only because it was reverted (to HEAD, past an edit that predates
+            // the session) wasn't committed by anyone.
+            let since = null;
+            if (s.head && hasHead) {
+              const r = await git(["diff", "--name-only", "-z", "--no-renames", s.head, "HEAD"]);
+              if (r.code === 0) since = new Set(r.stdout.split("\0").filter(Boolean));
+            }
+            for (const path of [...mine.keys()]) if (!listed.has(path) && since && !since.has(path)) mine.delete(path);
             // Staged files that aren't the session's would go into the commit too: shown apart.
             outside = staged.filter((f) => !mine.has(f.path));
             staged = staged.filter((f) => mine.has(f.path));
@@ -427,6 +502,15 @@ export default class Changes extends View {
           const cs = parseNumstat(cached.stdout), ws = parseNumstat(work.stdout);
           for (const f of staged) Object.assign(f, cs[f.path] ?? { add: 0, del: 0 });
           for (const f of changes) Object.assign(f, ws[f.path] ?? { add: 0, del: 0 });
+        }
+        // A staged file whose working copy is back to HEAD was reverted after staging: the
+        // commit would still put the staged version back in. Marked, and Commit refuses it.
+        if (hasHead && (staged.length || outside.length)) {
+          const r = await git(["diff", "--name-only", "-z", "--no-renames", "HEAD"]);
+          if (r.code === 0) {
+            const differs = new Set(r.stdout.split("\0").filter(Boolean));
+            for (const f of [...staged, ...outside]) f.reverted = !differs.has(f.path);
+          }
         }
         const cap = (items) => items.slice(0, 1000);
         const limited = [staged, outside, changes, committed].some((items) => items.length > 1000);
@@ -461,7 +545,8 @@ export default class Changes extends View {
       return first < 0 ? [item.binary ? "Binary file changed" : "No text diff available"] : all.slice(first);
     };
     let lines;
-    if (this.trees && group !== "outside") lines = await diff([this.trees.base, this.trees.now]);
+    // Staged files show what the commit would hold (HEAD → index), in Session mode too.
+    if (this.trees && group !== "outside" && group !== "staged") lines = await diff([this.trees.base, this.trees.now]);
     else if (group === "staged" || group === "outside") lines = await diff(["--cached"]);
     else if (item.fresh) {
       const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
@@ -516,7 +601,7 @@ export default class Changes extends View {
   // What a file is compared against in the side-by-side view (mods/diff-view): the same two
   // states this panel's own diff shows.
   sides(group, f) {
-    if (this.trees && group !== "outside") {
+    if (this.trees && group !== "outside" && group !== "staged") {
       const s = this.session(), at = s?.at ? new Date(s.at) : null;
       const since = at ? ` ${at.getHours()}:${String(at.getMinutes()).padStart(2, "0")}` : "";
       return { left: this.trees.base, right: "worktree", leftLabel: `Session start${since}`, rightLabel: "Working tree" };
@@ -567,6 +652,11 @@ export default class Changes extends View {
     if (!this.message.trim() || !this.root || this.busy || this.loading || this.context !== this.key()) return;
     const staged = this.group("staged"), outside = this.group("outside");
     if (!staged.length && !outside.length) { this.note = "Nothing is staged: stage files with + first"; cx.notify(); return; }
+    const reverted = [...staged, ...outside].filter((f) => f.reverted).map((f) => f.path);
+    if (reverted.length) {
+      this.note = `Reverted but still staged: ${reverted.slice(0, 3).join(", ")}${reverted.length > 3 ? ` +${reverted.length - 3}` : ""}. Unstage (−) to drop the change, or stage (+) again to commit it.`;
+      cx.notify(); return;
+    }
     const root = this.root, on = this.on, context = this.context, message = this.message.trim();
     const session = this.trees ? this.session() : null, paths = staged.map((f) => f.path);
     this.busy = true; this.note = null;
@@ -664,6 +754,7 @@ export default class Changes extends View {
       .child(typeIcon(FT, name, t))
       .child(h_flex().flex_1().min_w(0).gap(6).items_center()
         .child(div().min_w(0).max_w(240).truncate().text_color(f.status === "D" ? t.dim : t.foreground).child(name))
+        .when(Boolean(f.reverted), (e) => e.child(div().flex_none().text_size(11).text_color(t.blocked).child("reverted · still staged")))
         .when(!this.tree && parts.length > 0, (e) => e.child(div().min_w(0).truncate().text_size(11).text_color(t.dim).child(parts.join("/")))))
       .when(Boolean(compare), (e) => e.child(compare))
       .when(Boolean(action), (e) => e.child(action))
