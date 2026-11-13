@@ -9,6 +9,8 @@
 #   diff-view -> diff-view       side-by-side compare, opened from the Changes panel (new)
 #   git-graph -> git-graph       commit graph, opened from the Changes panel (new)
 #   workspace-status -> workspace-status-plus   status bar: click the branch to switch / create one
+#   spaces    -> spaces-plus     Spaces sidebar: groups (fold, drag in, right-click to move)
+#   menu      -> menu-plus       space menu with Move to group / New group, the group menu
 #
 # and a layout `main-focus` (a clone of `main`) that uses them. Your own layout stays as it
 # was: switch with ctrl-shift-l. Personal mods are never overwritten by app updates.
@@ -49,14 +51,20 @@ cp "$src"/git-graph/* "$home/mods/git-graph/"
 clone workspace-status workspace-status-plus
 sed 's|^const SELF = "workspace-status";|const SELF = "workspace-status-plus";|' "$src/workspace-status/main.js" > "$home/mods/workspace-status-plus/main.js"
 
-for m in changes-focus agents-view tabs-plus pane-grid diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
+clone spaces spaces-plus
+sed 's|^const MENU = "menu";|const MENU = "menu-plus";|' "$src/spaces/main.js" > "$home/mods/spaces-plus/main.js"
+
+clone menu menu-plus
+sed 's|^const SELF = "menu";|const SELF = "menu-plus";|' "$src/menu/main.js" > "$home/mods/menu-plus/main.js"
+
+for m in spaces-plus menu-plus changes-focus agents-view tabs-plus pane-grid diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
 
 # The layout: clone main once, then point its blocks at the personal mods.
 [ -f "$home/layouts/main-focus.json" ] || herdr-app do layout.clone '{"name":"main","as":"main-focus"}' >/dev/null
 python3 -I - "$home/layouts/main-focus.json" <<'EOF'
 import json, sys
 path = sys.argv[1]
-swap = {"changes": "changes-focus", "agents": "agents-view", "tabs": "tabs-plus", "workspace-status": "workspace-status-plus"}
+swap = {"changes": "changes-focus", "agents": "agents-view", "tabs": "tabs-plus", "workspace-status": "workspace-status-plus", "spaces": "spaces-plus"}
 layout = json.load(open(path))
 def walk(node):
     if isinstance(node, dict):

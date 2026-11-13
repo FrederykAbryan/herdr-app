@@ -49,6 +49,16 @@ async function both(a, b) {
   return done.map((d) => d.value);
 }
 
+// The menu mod this sidebar opens (space and group menus, the group-name prompt).
+const MENU = "menu";
+// Space groups, shared with the menu: [{ id, name, folded, spaces: [space ids] }]. Only a
+// way of showing the list: space order stays the app's, each group lists its spaces in it.
+const GROUPS = "spaces.groups";
+const groups = () => shared(GROUPS) ?? [];
+function setGroup(space, group) {
+  setShared(GROUPS, groups().map((g) => ({ ...g, spaces: [...(g.spaces ?? []).filter((id) => id !== space), ...(g.id === group ? [space] : [])] })));
+}
+
 // What a stored color name looks like on an avatar (the same in every mod
 // that draws space avatars): one strong color per hue, light and dark alike.
 const MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
@@ -282,7 +292,67 @@ export default class Spaces extends View {
 
   menu(w) {
     // A popup is as tall as its items; height is only the most.
-    openOverlay({ mod: "menu", kind: "popup", width: 200, height: 260, props: { tab: "space", target: { id: w.id } } });
+    openOverlay({ mod: MENU, kind: "popup", width: 220, height: 420, props: { tab: "space", target: { id: w.id } } });
+  }
+
+  // Rows in groups: loose spaces first, then each group under its header. A worktree row
+  // goes with the checkout row above it. Empty groups show with this computer's spaces.
+  // Returns [{ el, active }]: the caller finds the active row among them.
+  sectioned(rows, m, t, collapsed) {
+    const gs = groups();
+    const of = {};
+    for (const g of gs) for (const id of g.spaces ?? []) of[id] = g.id;
+    const units = [];
+    for (const r of rows) {
+      if (r.tree && units.length) units.at(-1).push({ ...r, group: units.at(-1)[0].group });
+      else units.push([{ ...r, group: of[r.w.id] ?? null }]);
+    }
+    const out = [];
+    const add = (r) => out.push({ el: collapsed ? this.compact(r, t) : this.row(r, t), active: r.w.active });
+    units.filter((u) => !u[0].group).flat().forEach(add);
+    for (const g of gs) {
+      const members = units.filter((u) => u[0].group === g.id).flat();
+      if (!members.length && m) continue;
+      out.push({ el: this.groupHead(g, members, t, collapsed), active: false });
+      if (!g.folded) members.forEach(add);
+    }
+    return out;
+  }
+
+  groupHead(g, members, t, collapsed) {
+    const hidden = g.folded && members.some((r) => r.w.active);
+    const over = this.pressed !== null && this.over === `group:${g.id}`;
+    const fold = (_e, cx) => {
+      setShared(GROUPS, groups().map((k) => (k.id === g.id ? { ...k, folded: !k.folded } : k)));
+      cx.notify();
+    };
+    const drop = (_e, cx) => {
+      if (this.pressed === null) return;
+      setGroup(this.pressed, g.id);
+      this.pressed = null;
+      this.over = null;
+      cx.notify();
+    };
+    const enter = (_e, cx) => {
+      if (this.pressed !== null && this.over !== `group:${g.id}`) { this.over = `group:${g.id}`; cx.notify(); }
+    };
+    const menu = () => openOverlay({ mod: MENU, kind: "popup", width: 200, height: 140, props: { tab: "group", target: { id: g.id } } });
+    if (collapsed) {
+      return railCell(div().id(`group-${g.id}`).w(RAIL_CELL).h(12).flex().items_center().justify_center().rounded(4)
+        .tooltip(`${g.name} · ${members.length}${g.folded ? " (folded)" : ""}`)
+        .hover((s) => s.bg(t.hover)).on_click(fold).on_mouse_down("right", menu)
+        .child(div().w(g.folded ? 10 : 18).h(2).rounded(1).bg(hidden ? t.accent : t.border)));
+    }
+    return h_flex().id(`group-${g.id}`).h(26).mt(6).flex_none().px(8).gap(6).items_center().rounded(7)
+      .text_size(11.5).text_color(hidden ? t.foreground : t.dim).cursor_pointer()
+      .when(hidden, (el) => el.bg(t.selected))
+      .when(over, (el) => el.border_1().border_color(t.accent))
+      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .on_click(fold).on_mouse_move(enter).on_mouse_up("left", drop).on_mouse_down("right", menu)
+      .child(svg(`mods/workspace-chrome/chevron-${g.folded ? "right" : "down"}.svg`).size(11).flex_none())
+      .child(svg("mods/workspace-chrome/folder.svg").size(13).flex_none())
+      .child(div().flex_1().min_w(0).truncate().font_semibold().child(g.name))
+      .child(div().flex_none().text_size(11).text_color(t.dim).child(String(members.length)));
   }
 
   orderingDue(now) {
@@ -333,7 +403,6 @@ export default class Spaces extends View {
   // The rows, under a header per machine once one isn't this computer.
   grouped(t, collapsed) {
     const rows = this.ordered();
-    const draw = (r) => (collapsed ? this.compact(r, t) : this.row(r, t));
     // Where the active space's row lands among the children this returns: the list scrolls by its direct
     // children, and machine headers, login notes and loading rows count too.
     this.activeAt = -1;
@@ -347,8 +416,9 @@ export default class Spaces extends View {
     const loadingRow = m => h_flex().id(`machine-loading-${m ?? "local"}`).h(28).flex_none().px(collapsed ? 0 : 8).items_center().when(collapsed, el => el.justify_center()).text_size(12).text_color(t.dim).child(collapsed ? "…" : "Loading…");
     if (!remote.length) {
       if (loading(null) && !rows.length) return [loadingRow(null)];
-      this.activeAt = rows.findIndex(r => r.w.active);
-      return rows.map(draw);
+      const drawn = this.sectioned(rows, null, t, collapsed);
+      this.activeAt = drawn.findIndex(d => d.active);
+      return drawn.map(d => d.el);
     }
     const machineNames = [null, ...remote];
     return machineNames.flatMap((m) => {
@@ -405,8 +475,9 @@ export default class Spaces extends View {
             .text_size(11).text_color(t.foreground).bg(t.raised).cursor_pointer().hover(s => s.bg(t.hover))
             .on_click((_e, cx) => { cx.stop_propagation(); cx.write_to_clipboard(login); this.copiedLogin = login; cx.notify(); })
             .child(this.copiedLogin === login ? "Copied" : "Copy")))] : [];
-      const items = [cell(head), ...guidance, ...(folded ? [] : mine.length ? mine.map(draw) : [loading(m) ? loadingRow(m) : cell(empty)])];
-      const first = folded ? -1 : mine.findIndex(r => r.w.active);
+      const drawn = folded ? [] : this.sectioned(mine, m, t, collapsed);
+      const items = [cell(head), ...guidance, ...(folded ? [] : drawn.length ? drawn.map(d => d.el) : [loading(m) ? loadingRow(m) : cell(empty)])];
+      const first = drawn.findIndex(d => d.active);
       if (first >= 0) this.activeAt = before + 1 + guidance.length + first;
       before += items.length;
       return items;
@@ -436,7 +507,7 @@ export default class Spaces extends View {
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
-  row({ w, i, g, tree }, t) {
+  row({ w, i, g, tree, group }, t) {
     const on = w.active;
     const fromIndex = this.pressed === null ? -1 : spaces().findIndex(s => s.id === this.pressed);
     const colors = shared("space.colors") ?? {};
@@ -478,6 +549,9 @@ export default class Spaces extends View {
         if (from !== null && over === w.id && from !== w.id) {
           const index = spaces().findIndex(s => s.id === w.id);
           if (index !== -1) run("space.move", { id: from, index: index + 1 });
+          // Dropped among another group's spaces (or the loose ones): it joins them.
+          const now = groups().find((k) => (k.spaces ?? []).includes(from))?.id ?? null;
+          if (now !== (group ?? null)) setGroup(from, group ?? null);
         } else if (from === w.id) run("space.select", { id: w.id });
         cx.notify();
       })
@@ -535,7 +609,11 @@ export default class Spaces extends View {
     return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
       .child(h_flex().h(31).pl(16).pr(10).items_center().justify_between().text_size(11.5).text_color(t.dim)
         .when(collapsed, el => el.pl(0).pr(0).justify_center())
-        .when(!collapsed, el => el.child("Spaces"))
+        .when(!collapsed, el => el.child(div().flex_1().child("Spaces"))
+          .child(div().id("group-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).tooltip("New group")
+            .hover(s => s.bg(t.hover).text_color(t.foreground))
+            .on_click(() => openOverlay({ mod: MENU, kind: "dialog", width: 380, height: 190, props: { groupPrompt: { mode: "new" } } }))
+            .child(svg("mods/workspace-chrome/folder-plus.svg").size(14))))
         .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
           .on_click(() => run("space.new")).child(svg("mods/workspace-chrome/plus.svg").size(14))))
       .child(v_flex().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)

@@ -4,8 +4,32 @@
 // a command "worktree" opens the worktree dialog instead.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
-import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, exec } from "herdr";
+import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, exec, shared, setShared } from "herdr";
+
+// This mod's own name: its group-name prompt opens another copy of it.
+const SELF = "menu";
+
+// Space groups (shared with the spaces sidebar): [{ id, name, folded, spaces: [space ids] }].
+const GROUPS = "spaces.groups";
+const groups = () => shared(GROUPS) ?? [];
+// A space is in at most one group; `group` null takes it out of all.
+function setGroup(space, group, list = groups()) {
+  setShared(GROUPS, list.map((g) => ({ ...g, spaces: [...(g.spaces ?? []).filter((id) => id !== space), ...(g.id === group ? [space] : [])] })));
+}
+function editGroups(prompt, name) {
+  name = name.trim();
+  if (!name) return;
+  const list = groups();
+  if (prompt.mode === "rename") { setShared(GROUPS, list.map((g) => (g.id === prompt.group ? { ...g, name } : g))); return; }
+  const id = `g${Date.now().toString(36)}`;
+  const next = [...list, { id, name, folded: false, spaces: [] }];
+  if (prompt.space) setGroup(prompt.space, id, next);
+  else setShared(GROUPS, next);
+}
+function groupPrompt(prompt) {
+  openOverlay({ mod: SELF, kind: "dialog", width: 380, height: 190, props: { groupPrompt: prompt } });
+}
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s) {
@@ -60,12 +84,23 @@ function items(p, git) {
         ["New tab", "tab.new", { space: tg.space }],
         ["Close", "tab.close", { id: tg.id }],
       ];
-    case "space":
+    case "space": {
+      const gs = groups();
+      const mine = gs.find((g) => (g.spaces ?? []).includes(tg.id));
       return [
         ["Rename", "space.rename", { id: tg.id }],
         ...(git ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
         ...(git === "linked" ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
+        ...gs.filter((g) => g !== mine).map((g) => [`Move to ${g.name}`, "group.move", { space: tg.id, group: g.id }]),
+        ...(mine ? [[`Remove from ${mine.name}`, "group.leave", { space: tg.id }]] : []),
+        ["New group…", "group.new", { space: tg.id }],
         ["Close", "space.close", { id: tg.id }],
+      ];
+    }
+    case "group":
+      return [
+        ["Rename group", "group.rename", { group: tg.id }],
+        ["Delete group", "group.delete", { group: tg.id }],
       ];
     default:
       return [
@@ -80,6 +115,7 @@ function items(p, git) {
 }
 
 function menuIcon(command) {
+  if (command.startsWith("group.")) return `mods/workspace-chrome/${{ move: "folder", leave: "minus", new: "folder-plus", rename: "square-pen", delete: "x" }[command.slice(6)]}.svg`;
   const name = command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen" : command.endsWith(".new") ? "plus" : command === "worktree" ? "git-branch" : command === "app.help" ? "terminal" : command === "app.theme" ? "settings" : command === "pane.split" ? "panel-right" : command === "pane.zoom" ? "square" : "terminal";
   return `mods/workspace-chrome/${name}.svg`;
 }
@@ -97,8 +133,17 @@ export default class Menu extends View {
     this.at = 0;
     this.git = null;
     this.handle = cx.focus_handle();
-    this.handle.focus();
     const p = props();
+    if (p?.groupPrompt) {
+      const old = p.groupPrompt.mode === "rename" ? groups().find((g) => g.id === p.groupPrompt.group)?.name ?? "" : "";
+      this.input = InputState.new({ value: old });
+      if (old) this.input.set_selected_range({ start: 0, end: old.length });
+      this.input.on("submit", () => this.submitName());
+      this.input.focus();
+      cx.timer.after(600, () => this.input.focus());
+      return;
+    }
+    this.handle.focus();
     const space = p?.tab === "space" && spaces().find((s) => s.id === p.target?.id);
     const folder = space && place(space);
     if (folder)
@@ -112,12 +157,43 @@ export default class Menu extends View {
     const it = items(props(), this.git)[i];
     if (!it) return;
     closeOverlay(props()?.overlay);
-    if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
+    const a = it[2];
+    if (it[1] === "group.move") setGroup(a.space, a.group);
+    else if (it[1] === "group.leave") setGroup(a.space, null);
+    else if (it[1] === "group.new") groupPrompt({ mode: "new", space: a.space });
+    else if (it[1] === "group.rename") groupPrompt({ mode: "rename", group: a.group });
+    else if (it[1] === "group.delete") setShared(GROUPS, groups().filter((g) => g.id !== a.group));
+    else if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     else run(it[1], it[2]);
+  }
+
+  submitName() {
+    const p = props();
+    closeOverlay(p.overlay);
+    editGroups(p.groupPrompt, this.input.value());
+  }
+
+  // The group-name dialog: Enter saves, Esc cancels.
+  renderPrompt(t, p) {
+    const button = (id, text, primary, action) => h_flex().id(id).h(32).px(14).items_center().rounded(8)
+      .border_1().border_color(primary ? t.solid : t.input).bg(primary ? t.solid : t.raised)
+      .text_color(primary ? t.solid_foreground : t.foreground).text_size(12.5).font_medium().cursor_pointer()
+      .hover((s) => s.opacity(0.88)).on_click(action).child(text);
+    return v_flex().id("group-prompt").track_focus(this.handle)
+      .on_key_down((e, cx) => { if (e.key === "escape") { closeOverlay(p.overlay); cx.stop_propagation(); } })
+      .w_full().min_h(0).p(18).bg(t.popover).text_color(t.foreground)
+      .child(h_flex().items_center().child(div().flex_1().text_size(15).font_semibold().child(p.groupPrompt.mode === "rename" ? "Rename group" : "New group"))
+        .child(div().text_size(11).text_color(t.dim).child("Esc")))
+      .child(div().pt(16).pb(7).text_size(11.5).text_color(t.dim).child("Name"))
+      .child(Input.new(this.input).h(36).px(10).rounded(9).border_1().border_color(t.accent).bg(t.background).text_size(12.8).text_color(t.foreground))
+      .child(h_flex().pt(20).gap(8).justify_end()
+        .child(button("gp-cancel", "Cancel", false, () => closeOverlay(p.overlay)))
+        .child(button("gp-save", "Save", true, () => this.submitName())));
   }
 
   render(cx) {
     const t = theme();
+    if (props()?.groupPrompt) return this.renderPrompt(t, props());
     const list = items(props(), this.git);
     return v_flex()
       .id("menu")
@@ -138,7 +214,7 @@ export default class Menu extends View {
       .children(
         list.map((it, i) =>
           v_flex()
-            .when(i > 0 && (it[1].endsWith(".close") || it[1] === "app.help" || (it[1] === "app.theme" && list[i - 1][1] !== "app.theme")), el => el.child(div().mx(7).my(4).h(1).bg(t.border)))
+            .when(i > 0 && (it[1].endsWith(".close") || (it[1].startsWith("group.") && !list[i - 1][1].startsWith("group.")) || it[1] === "app.help" || (it[1] === "app.theme" && list[i - 1][1] !== "app.theme")), el => el.child(div().mx(7).my(4).h(1).bg(t.border)))
             .child(h_flex()
             .id(`mi-${i}`)
             .h(31)
