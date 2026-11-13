@@ -26,6 +26,20 @@ This fork changes only the JavaScript panels (mods) in `defaults/mods/`. The app
 - **Grid button.** Split the focused pane into 2 side by side, 2 stacked, 1 + 2 or 2 × 2, with a terminal or any installed agent in each new pane.
 - **Full screen.** Hides the sidebar, side panel and status bar and maximizes the window; click again to restore exactly what was shown.
 
+**Compare view — a file side by side** (new `defaults/mods/diff-view`)
+- Opens from the Changes panel: the split icon on a file row, a double-click, or **Compare** above the inline diff.
+- **Side by side or inline**, showing only the changes with unchanged lines folded, or the whole file. Drag the middle line to resize the sides; both scroll sideways together.
+- **n / p** jump to the next or previous change (or click the counter), and **[ / ]** to the previous or next file.
+- **Live.** The right side is read again every few seconds, so an agent's edits show as they happen.
+- What it compares follows the panel: in Session mode the agent's starting snapshot against the working tree, for staged files HEAD against the index, and in All mode the index against the working tree.
+
+**Git graph — the repo's history** (new `defaults/mods/git-graph`)
+- The graph button in the Changes panel opens the repo's commits as a graph, with lanes, branches, remote branches and tags.
+- Click a commit for its message and files, then click a file to compare it in the compare view. Commits load in pages of 800.
+
+**Status bar — switch branches** (`defaults/mods/workspace-status`)
+- Click the branch in the status bar for a branch picker: filter, switch to a local branch, track a remote one, or create a new branch.
+
 **Spaces sidebar — groups** (`defaults/mods/spaces`, `defaults/mods/menu`)
 - **New group.** Use the folder button next to **+** in the Spaces header, or right-click a space and choose **New group…** to start a group with that space in it.
 - **Move spaces in and out.** Right-click a space for **Move to <group>** or **Remove from <group>**, or drag it onto a group's header or among the spaces of another group (or the ungrouped ones).
@@ -44,7 +58,7 @@ git switch feat/changes-session-focus   # the default branch of this fork
 sh scripts/install-fork-mods.sh
 ```
 
-The script installs everything as **personal copies**: `changes-focus`, `agents-view`, `tabs-plus`, `pane-grid`, `spaces-plus` and `menu-plus`, plus a layout `main-focus` that uses them, and switches to that layout. Herdr's own panels and your existing layout stay as they were. **Ctrl+Shift+L** switches layouts, and deleting those folders in `~/.config/herdr-app` removes the fork's panels. App updates never overwrite personal copies, but they also don't bring upstream fixes into them. Re-run the script after pulling this fork.
+The script installs everything as **personal copies**: `changes-focus`, `agents-view`, `tabs-plus`, `pane-grid`, `diff-view`, `git-graph`, `workspace-status-plus`, `spaces-plus` and `menu-plus`, plus a layout `main-focus` that uses them, and switches to that layout. Herdr's own panels and your existing layout stay as they were. **Ctrl+Shift+L** switches layouts, and deleting those folders in `~/.config/herdr-app` removes the fork's panels. App updates never overwrite personal copies, but they also don't bring upstream fixes into them. Re-run the script after pulling this fork.
 
 **Requirements and limits:**
 - Session focus and Generate need `git`, and on remote machines `env`, `cp` and `/tmp` (Linux, macOS, Unix servers; not Windows).
@@ -53,7 +67,7 @@ The script installs everything as **personal copies**: `changes-focus`, `agents-
 
 ## License and credits
 
-- Herdr is © the Herdr authors and licensed under the [Apache License 2.0](LICENSE); this fork keeps that license. The fork's changes are the files under `defaults/mods/changes`, `defaults/mods/agents`, `defaults/mods/tabs`, `defaults/mods/pane-grid`, `defaults/mods/spaces`, `defaults/mods/menu` and `scripts/install-fork-mods.sh`, plus this section of the README.
+- Herdr is © the Herdr authors and licensed under the [Apache License 2.0](LICENSE); this fork keeps that license. The fork's changes are the files under `defaults/mods/changes`, `defaults/mods/agents`, `defaults/mods/tabs`, `defaults/mods/pane-grid`, `defaults/mods/diff-view`, `defaults/mods/git-graph`, `defaults/mods/workspace-status`, `defaults/mods/spaces`, `defaults/mods/menu` and `scripts/install-fork-mods.sh`, plus this section of the README.
 - The `scm-*.svg` icons are [Codicons](https://github.com/microsoft/vscode-codicons) by Microsoft, licensed CC BY 4.0. See `CODICONS-LICENSE` in the mod folders.
 
 ---
