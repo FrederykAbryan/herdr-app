@@ -56,11 +56,29 @@ const kidStatus = (k, listed) => {
   const s = listed.get(k.address) ?? k.status;
   return s === "error" ? "blocked" : s === "done" ? "idle" : s;
 };
-const SORTS = [
-  { id: "priority", label: "Priority", icon: "clock" },
-  { id: "grouped", label: "Grouped by space", icon: "layers" },
+// The view menu opens this mod again as a popup: its own folder name.
+const SELF = "agents";
+const GROUPS = [
+  { id: "status", label: "Status" },
+  { id: "space", label: "Space" },
+  { id: "tab", label: "Tab" },
+  { id: "agent", label: "Agent" },
+  { id: "none", label: "None" },
 ];
-const sortOf = () => SORTS.find((s) => s.id === shared("agents.sort")) ?? SORTS[0];
+const ORDERS = [
+  { id: "priority", label: "Most urgent" },
+  { id: "recent", label: "Recently changed" },
+  { id: "name", label: "Name" },
+  { id: "layout", label: "Sidebar order" },
+];
+// How agents are grouped, ordered and filtered. Kept in shared state so every copy shows the
+// same; until one is picked, the old single choice ("agents.sort") still decides.
+function viewOf() {
+  const old = shared("agents.sort");
+  const group = GROUPS.find((g) => g.id === shared("agents.group")) ?? GROUPS.find((g) => g.id === (old === "grouped" ? "space" : "status"));
+  const order = ORDERS.find((o) => o.id === shared("agents.order")) ?? ORDERS.find((o) => o.id === (old === "grouped" ? "layout" : "priority"));
+  return { group: group.id, groupLabel: group.label, order: order.id, orderLabel: order.label, hideIdle: shared("agents.hideIdle") === true };
+}
 const SECTION = { 4: "Needs you", 3: "Done", 2: "Working", 1: "Idle" };
 const SECTION_STATUS = { 4: "blocked", 3: "done", 2: "working" };
 
@@ -135,30 +153,36 @@ export default class Agents extends View {
     return RANK[a.status] ?? 0;
   }
 
+  // The view menu stays open while choices are made: each one shows in the list at once.
   sortMenu(t) {
-    const on = sortOf().id;
+    const v = viewOf();
+    const title = (s) => div().px(8).pt(6).pb(4).text_size(11).text_color(t.dim).child(s);
+    const line = () => div().h(1).mx(4).my(4).bg(t.border);
+    const option = (id, label, on, choose) => h_flex()
+      .id(id)
+      .h(28)
+      .px(8)
+      .gap(9)
+      .rounded(7)
+      .items_center()
+      .text_color(t.foreground)
+      .cursor_pointer()
+      .hover((el) => el.bg(t.hover))
+      .on_click(() => choose())
+      .child(div().flex_1().child(label))
+      .when(on, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)));
     return v_flex()
       .w_full()
       .p(5)
       .bg(t.popover)
       .text_size(12.8)
-      .child(div().px(8).pt(4).pb(6).text_size(11).text_color(t.dim).child("Sort agents"))
-      .children(SORTS.map((s) => h_flex()
-        .id(`sort-${s.id}`)
-        .h(31)
-        .px(8)
-        .gap(9)
-        .rounded(7)
-        .items_center()
-        .text_color(t.foreground)
-        .hover((el) => el.bg(t.hover))
-        .on_click(() => {
-          setShared("agents.sort", s.id);
-          closeOverlay(props().overlay);
-        })
-        .child(svg(`mods/workspace-chrome/${s.icon}.svg`).size(14).flex_none().text_color(t.muted))
-        .child(div().flex_1().child(s.label))
-        .when(s.id === on, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)))));
+      .child(title("Group by"))
+      .children(GROUPS.map((g) => option(`group-${g.id}`, g.label, v.group === g.id, () => setShared("agents.group", g.id))))
+      .child(line())
+      .child(title("Sort by"))
+      .children(ORDERS.map((o) => option(`order-${o.id}`, o.label, v.order === o.id, () => setShared("agents.order", o.id))))
+      .child(line())
+      .child(option("hide-idle", "Hide idle agents", v.hideIdle, () => setShared("agents.hideIdle", !v.hideIdle)));
   }
 
   peek(addr) {
@@ -218,7 +242,7 @@ export default class Agents extends View {
     const t = theme();
     if (props()?.sortMenu) return this.sortMenu(t);
     const collapsed = narrow();
-    const sort = sortOf();
+    const view = viewOf();
     let list = agents();
     this.listed = new Map(list.map((a) => [a.address, a.status]));
     const all = terminals();
@@ -232,14 +256,14 @@ export default class Agents extends View {
     list = list.filter((a) => a.pinned || !nested.has(a.address));
     const tabCounts = new Map();
     for (const a of list) tabCounts.set(a.tab, (tabCounts.get(a.tab) ?? 0) + 1);
-    const byPriority = sort.id === "priority";
+    // byPriority: status sections, whose headers already say the state.
+    const byPriority = view.group === "status";
     const urgency = new Map(list.map((a) => [a.address, Math.max(this.rank(a), ...this.tree(all, a.address).map((s) => RANK[kidStatus(s.t, this.listed)] ?? 0))]));
     const rankOf = (a) => urgency.get(a.address);
-    if (byPriority) list = [...list].sort((x, y) => rankOf(y) - rankOf(x) || this.since(y) - this.since(x) || y.seq - x.seq);
-    const pinned = list.filter((a) => a.pinned);
-    const rest = list.filter((a) => !a.pinned);
-    list = [...pinned, ...rest];
-    setAgentOrder(list.map((a) => a.address));
+    const total = list.length;
+    // Hide idle keeps the focused agent and pinned ones, and any with a sub-agent at work.
+    if (view.hideIdle) list = list.filter((a) => a.pinned || a.focused || (rankOf(a) ?? 0) > RANK.idle);
+    const hidden = total - list.length;
 
     const withKids = (a, i) => {
       const subs = collapsed ? [] : this.tree(all, a.address);
@@ -293,6 +317,17 @@ export default class Agents extends View {
       if (detail.get(a.address) == null && seen[`${a.space_name}\u0000`] > 1) detail.set(a.address, label(a));
     }
 
+    // Under a space header the space goes without saying; under a tab header so does the tab,
+    // so the row names its agent. An automatic tab number says nothing. Without such a header
+    // above (status, agent, none, pinned) the row names its space, with its detail after it.
+    const fullRow = (a) => a.pinned || !["space", "tab"].includes(view.group);
+    const rowName = (a) => {
+      const more = detail.get(a.address);
+      if (fullRow(a)) return a.space_name || label(a);
+      if (view.group === "tab") return tabCounts.get(a.tab) > 1 ? label(a) : a.program?.name || label(a);
+      return more ?? (/^\d+$/.test(label(a)) ? a.program?.name || label(a) : label(a));
+    };
+
     const row = (a, i, subs = []) => {
       const pic = icon(a.program, 16, t.foreground);
       const more = detail.get(a.address);
@@ -331,10 +366,7 @@ export default class Agents extends View {
           cx.notify();
         })
         .child(svg(`mods/workspace-chrome/${isPinned ? "pin-off" : "pin"}.svg`).size(13));
-      // Under a space header the space goes without saying; an automatic tab number says nothing.
-      // Without a space header above (priority, pinned) the row names its space.
-      const full = byPriority || isPinned;
-      const name = full ? a.space_name || label(a) : more ?? (/^\d+$/.test(label(a)) ? a.program?.name || label(a) : label(a));
+      const full = fullRow(a), name = rowName(a);
       return h_flex()
         .id(`ag-${a.address}`)
         .px(8)
@@ -368,15 +400,37 @@ export default class Agents extends View {
         .child(this.status(t, a, byPriority && !isPinned));
     };
 
-    // Groups in list order: spaces (grouped) or priority sections. Agents of a
-    // space are next to each other in agents(), so neighbours make a group.
-    const groups = pinned.length ? [{ id: "pinned", label: "Pinned", status: null, members: pinned }] : [];
-    for (const a of rest) {
-      const r = rankOf(a) || RANK.idle;
-      const id = byPriority ? `sec-${r}` : `sp-${a.space}`;
-      if (groups.at(-1)?.id === id) groups.at(-1).members.push(a);
-      else groups.push({ id, label: byPriority ? SECTION[r] : a.space_name || "", status: byPriority ? SECTION_STATUS[r] : null, members: [a] });
+    // Order within a group; "layout" keeps agents() order (space, tab, pane).
+    const ORDER = {
+      priority: (x, y) => rankOf(y) - rankOf(x) || this.since(y) - this.since(x) || y.seq - x.seq,
+      recent: (x, y) => this.since(y) - this.since(x) || y.seq - x.seq,
+      name: (x, y) => String(rowName(x)).localeCompare(String(rowName(y))) || x.seq - y.seq,
+    }[view.order];
+    // Each agent's group: id, header and, for status sections, the state it's colored by.
+    // Groups come in the order their first agent does in agents(), except status sections
+    // (most urgent first) and agents (by name).
+    const tabName = (a) => tabs.get(a.tab)?.name ?? String((a.tab_index ?? 0) + 1);
+    const groupOf = {
+      status: (a) => { const r = rankOf(a) || RANK.idle; return { id: `sec-${r}`, label: SECTION[r], status: SECTION_STATUS[r], rank: r }; },
+      space: (a) => ({ id: `sp-${a.space}`, label: a.space_name || "" }),
+      tab: (a) => ({ id: `tab-${a.tab}`, label: `${a.space_name || ""} · ${tabName(a)}` }),
+      agent: (a) => ({ id: `app-${a.program?.key ?? a.app ?? "program"}`, label: a.program?.name || a.app || "Program" }),
+      none: () => ({ id: "all", label: "" }),
+    }[view.group];
+    const pinned = list.filter((a) => a.pinned);
+    const byGroup = new Map();
+    for (const a of list.filter((a) => !a.pinned)) {
+      const g = groupOf(a);
+      if (!byGroup.has(g.id)) byGroup.set(g.id, { ...g, members: [] });
+      byGroup.get(g.id).members.push(a);
     }
+    const grouped = [...byGroup.values()];
+    if (view.group === "status") grouped.sort((x, y) => y.rank - x.rank);
+    if (view.group === "agent") grouped.sort((x, y) => x.label.localeCompare(y.label));
+    if (ORDER) { pinned.sort(ORDER); for (const g of grouped) g.members.sort(ORDER); }
+    const groups = pinned.length ? [{ id: "pinned", label: "Pinned", status: null, members: pinned }, ...grouped] : grouped;
+    list = groups.flatMap((g) => g.members);
+    setAgentOrder(list.map((a) => a.address));
 
     // A group's header; it folds the group. Folded, it says how many and the most urgent state.
     const header = (g) => {
@@ -399,7 +453,7 @@ export default class Agents extends View {
           cx.notify();
         })
         .child(div().truncate().text_color(t[g.status] ?? t.dim).child(g.label))
-        .when(byPriority || !open, (el) => el.child(div().text_color(t.dim).child(String(g.members.length))))
+        .when(view.group !== "space" || !open, (el) => el.child(div().text_color(t.dim).child(String(g.members.length))))
         .child(div().flex_1())
         .when(!open, (el) => el
           .when(!byPriority && top && top !== "idle", (el) => el.child(this.status(t, { status: top }, true)))
@@ -407,7 +461,8 @@ export default class Agents extends View {
     };
     const rows = collapsed
       ? list.flatMap(withKids)
-      : groups.flatMap((g) => [header(g), ...(this.folded.has(g.id) ? [] : g.members.flatMap(withKids))]);
+      // Ungrouped ("none") has no header to fold it by.
+      : groups.flatMap((g) => g.id === "all" ? g.members.flatMap(withKids) : [header(g), ...(this.folded.has(g.id) ? [] : g.members.flatMap(withKids))]);
 
     return v_flex()
       .size_full()
@@ -433,14 +488,16 @@ export default class Agents extends View {
                 .text_size(11)
                 .text_color(t.dim)
                 .hover((s) => s.text_color(t.foreground))
-                .on_click(() => openOverlay({ mod: "agents", kind: "popup", width: 200, height: 140, props: { sortMenu: true } }))
-                .tooltip(`Sort agents: ${sort.label}`)
-                .child(svg(`mods/workspace-chrome/${sort.icon}.svg`).size(14)),
+                .on_click(() => openOverlay({ mod: SELF, kind: "popup", width: 210, height: 372, props: { sortMenu: true } }))
+                .tooltip(`View: by ${view.groupLabel.toLowerCase()}, ${view.orderLabel.toLowerCase()}${view.hideIdle ? ", idle hidden" : ""}`)
+                .child(svg(`mods/workspace-chrome/${view.group === "status" ? "clock" : "layers"}.svg`).size(14)),
             ),
         ),
       )
       .when(list.length === 0 && !collapsed, (el) =>
-        el.child(div().px(12).text_size(12).text_color(t.dim).child("No agent status yet. Agents show up here when they report their status. Older versions and agents inside tmux may not.")),
+        el.child(div().px(12).text_size(12).text_color(t.dim).child(hidden
+          ? `${hidden} idle agent${hidden === 1 ? "" : "s"} hidden. Turn off Hide idle agents in the view menu to see ${hidden === 1 ? "it" : "them"}.`
+          : "No agent status yet. Agents show up here when they report their status. Older versions and agents inside tmux may not.")),
       )
       .child(v_flex().id("ag-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(rows))
       .when(collapsed, (el) =>
