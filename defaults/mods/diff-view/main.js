@@ -11,6 +11,9 @@ import { exec, theme, settings, props, closeOverlay } from "herdr";
 const SELF = "mods/diff-view";
 const icon = (name, size = 16) => svg(`${SELF}/${name}.svg`).size(size).flex_none();
 const CONTEXT = 3, ROW = 20, CHAR = 7.6;
+// Up to this many lines draw as a plain list, which can scroll to a change; more would take too
+// long to draw each frame, so they go in a virtual list (a screen at a time, no jumping).
+const PLAIN_MAX = 500;
 
 // Both sides into temp files, then git's own diff with the whole file as context.
 const DIFF = `
@@ -189,6 +192,8 @@ export default class DiffView extends View {
     this.items = items; this.blocks = blocks;
   }
 
+  plain() { return !this.full && this.lines().length <= PLAIN_MAX; }
+
   endDrag(cx) {
     if (!this.drag) return;
     this.drag = null;
@@ -216,7 +221,7 @@ export default class DiffView extends View {
     return n;
   }
   jump(cx) {
-    if (this.full || this.change < 0 || !this.blocks?.length) return;
+    if (!this.plain() || this.change < 0 || !this.blocks?.length) return;
     // A little room above the change, like an editor's reveal.
     this.scroll.scroll_to_item(Math.max(0, this.lineOf(this.blocks[this.change]) - 3));
     cx.notify();
@@ -327,7 +332,7 @@ export default class DiffView extends View {
     const t = theme(), f = this.file();
     if (!f) return div().id("diff-view").size_full().p(20).bg(t.background).text_color(t.dim).child("Nothing to compare");
     const parts = f.path.split("/"), name = parts.pop(), lines = this.lines();
-    const widths = this.sides();
+    const widths = this.sides(), plain = !this.full && lines.length <= PLAIN_MAX;
     if ((this.hx ?? 0) > this.maxHx()) this.hx = this.maxHx();
     const n = this.blocks?.length ?? 0, at = this.change;
     const empty = this.note ?? (this.rows ? null : "Loading…");
@@ -401,9 +406,9 @@ export default class DiffView extends View {
               if (dx) { this.scrollX(-dx, cx); cx.stop_propagation(); }
             })
             .child(div().w_full().h_full().relative()
-              .when(!this.full, (e) => e.child(v_flex().id("diff-plain").absolute().inset_0().overflow_y_scroll().track_scroll(this.scroll)
+              .when(plain, (e) => e.child(v_flex().id("diff-plain").absolute().inset_0().overflow_y_scroll().track_scroll(this.scroll)
                 .children(lines.map((it) => this.line(it, widths, t)))))
-              .when(this.full, (e) => e.child(v_virtual_list("diff-rows", lines.length, ROW, (i) => String(i),
+              .when(!plain, (e) => e.child(v_virtual_list("diff-rows", lines.length, ROW, (i) => String(i),
                 (range) => lines.slice(range.start, range.end).map((it) => this.line(it, widths, t))).size_full()))))
           .when(this.split, (e) => e.child(div().id("divider").absolute().top(0).bottom(0).left(widths[0] - 3).w(7).cursor_col_resize()
             .flex().justify_center()
@@ -414,8 +419,8 @@ export default class DiffView extends View {
               cx.notify();
             })
             .child(div().w(this.drag ? 3 : 1).h_full().bg(this.drag ? t.accent : t.border).hover((st) => st.bg(t.accent)))))
-          .when(!this.full, (e) => e.child(Scrollbar.vertical("diff-plain").absolute().inset_0()))
-          .when(this.full, (e) => e.child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0()))))
+          .when(plain, (e) => e.child(Scrollbar.vertical("diff-plain").absolute().inset_0()))
+          .when(!plain, (e) => e.child(Scrollbar.vertical("diff-rows").viewport_from_layout().absolute().inset_0()))))
       .child(h_flex().h(24).flex_none().px(12).gap(14).items_center().border_t(1).border_color(t.border).text_size(11).text_color(t.dim)
         .child("n / p  next / previous change").child("[ / ]  previous / next file").child("f  full file").child("s  side by side / inline").child("shift+wheel / ← →  scroll sideways").child("drag the middle line to resize").child("Esc  close"));
   }
