@@ -241,6 +241,20 @@ export default class Changes extends View {
     this.input.on("submit", (_e, cx) => this.commit(cx));
     this.input.on("focus", (_e, cx) => { this.typing = true; cx.notify(); });
     this.input.on("blur", (_e, cx) => { this.typing = false; cx.notify(); });
+    // Search: text in every file of the working tree (see search()).
+    this.searching = false; this.query = ""; this.found = null; this.foundFolded = new Set(); this.findSeq = 0; this.findRun = 0;
+    try { this.findCase = localStorage.getItem("findCase") === "1"; this.findRegex = localStorage.getItem("findRegex") === "1"; }
+    catch { this.findCase = false; this.findRegex = false; }
+    this.find = InputState.new({ placeholder: "Search in all files" });
+    // Runs a moment after typing stops, not on every key.
+    this.find.on("change", (_e, cx) => {
+      const q = this.find.value();
+      if (q === this.query) return;
+      this.query = q;
+      const seq = ++this.findSeq;
+      cx.timer.after(250, (cx) => { if (seq === this.findSeq) this.search(cx); });
+    });
+    this.find.on("submit", (_e, cx) => this.search(cx));
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
     cx.timer.every(3000, (cx) => this.attribute(cx));
@@ -800,6 +814,149 @@ export default class Changes extends View {
       .child(body);
   }
 
+  // Search, like VS Code's: text in every file of the working tree, tracked or not, minus what
+  // .gitignore leaves out (git grep: fast, skips binaries). Not only the changed files.
+  setSearching(on, cx) {
+    this.searching = on;
+    if (on) { this.find.focus(); if (this.query.length >= 2) this.search(cx); }
+    else this.handle.focus();
+    cx.notify();
+  }
+  setFindOption(name, cx) {
+    this[name] = !this[name];
+    try { localStorage.setItem(name, this[name] ? "1" : "0"); } catch {}
+    this.search(cx);
+  }
+  // The query as a JavaScript pattern, to mark the matches in the results; null if it isn't one.
+  findPattern() {
+    const q = this.found?.query ?? "";
+    if (!q) return null;
+    try { return new RegExp(this.found.regex ? q : q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), this.found.matchCase ? "g" : "gi"); }
+    catch { return null; }
+  }
+  search(cx) {
+    const q = this.query, root = this.root, on = this.on;
+    if (!root || q.length < 2) {
+      this.findRun++; this.found = null; this.finding = false;
+      this.findNote = !root ? "Not a git repository" : q ? "Type at least 2 characters" : null;
+      cx.notify(); return;
+    }
+    const seq = ++this.findRun, matchCase = this.findCase, regex = this.findRegex;
+    this.finding = true; this.findNote = null;
+    cx.spawn(async (cx) => {
+      try {
+        const args = [...READ, "grep", "-n", "-I", "-z", "--untracked", "--no-color", "--full-name", "--max-count", "200", regex ? "-E" : "-F"];
+        if (!matchCase) args.push("-i");
+        args.push("-e", q, "--", ".");
+        const r = await exec("git", args, { cwd: root, on, timeout: 30000 });
+        if (seq !== this.findRun) return;
+        // 1: nothing found. More: a bad pattern or a git error.
+        if (r.code > 1) throw new Error((r.stderr || r.stdout).trim().split("\n")[0] || `git grep failed (${r.code})`);
+        // -z: path \0 line \0 text, one match per line.
+        const files = new Map();
+        let count = 0, capped = false;
+        for (const rec of r.stdout.split("\n")) {
+          const a = rec.indexOf("\0"), b = a < 0 ? -1 : rec.indexOf("\0", a + 1);
+          if (b < 0) continue;
+          if (count >= 2000) { capped = true; break; }
+          const path = rec.slice(0, a);
+          if (!files.has(path)) files.set(path, []);
+          files.get(path).push({ line: Number(rec.slice(a + 1, b)), text: untab(rec.slice(b + 1)).slice(0, 500) });
+          count++;
+        }
+        this.found = { query: q, matchCase, regex, root, files: [...files].map(([path, hits]) => ({ path, hits })), count, capped };
+        this.findAt = null;
+      } catch (e) { if (seq === this.findRun) { this.found = null; this.findNote = String(e?.message ?? e); } }
+      finally { if (seq === this.findRun) { this.finding = false; cx.notify(); } }
+    });
+    cx.notify();
+  }
+  // The results as the list draws them: a row per file, then its matches unless folded.
+  // Kept until the results or the folding change: render asks on every redraw.
+  findRows() {
+    if (this.findDrawn?.found === this.found && this.findDrawn.ver === this.foldVer) return this.findDrawn.out;
+    const out = [];
+    for (const file of this.found?.files ?? []) {
+      out.push({ file });
+      if (!this.foundFolded.has(file.path)) for (const hit of file.hits) out.push({ file, hit });
+    }
+    this.findDrawn = { found: this.found, ver: this.foldVer, out };
+    return out;
+  }
+  // Opens a match in the side-by-side view (mods/diff-view), on the whole file at that line;
+  // every file found is a step away there ([ and ]).
+  openFound(file, hit, cx) {
+    const found = this.found;
+    if (!found) return;
+    this.findAt = `${file.path}:${hit.line}`;
+    const files = found.files.map((f) => ({ key: `find|${f.path}`, path: f.path, status: "",
+      left: this.hasHead ? "HEAD" : "none", right: "worktree", leftLabel: this.hasHead ? "HEAD" : "Empty", rightLabel: "Working tree",
+      line: f === file ? hit.line : f.hits[0]?.line, find: found.query }));
+    const index = found.files.indexOf(file);
+    openOverlay({ mod: "diff-view", kind: "dialog", width: 0.94, height: 0.92, props: { root: found.root, on: this.on, files, index, edit: false } });
+    cx.notify();
+  }
+  // A match's line, the matching parts marked.
+  findText(text, t) {
+    const re = this.findPattern(), body = text.trimStart(), parts = [];
+    let last = 0;
+    if (re) for (const m of body.matchAll(re)) {
+      if (!m[0]) break;
+      if (m.index > last) parts.push(div().flex_none().child(body.slice(last, m.index)));
+      parts.push(div().flex_none().rounded(2).bg(t.ansi3 + "55").text_color(t.foreground).child(m[0]));
+      last = m.index + m[0].length;
+      if (parts.length > 40) break;
+    }
+    if (last < body.length) parts.push(div().flex_none().child(body.slice(last)));
+    return h_flex().flex_1().min_w(0).overflow_hidden().whitespace_nowrap().text_color(t.muted).children(parts);
+  }
+  findRow(row, t) {
+    if (!row.hit) {
+      const parts = row.file.path.split("/"), name = parts.pop(), open = !this.foundFolded.has(row.file.path);
+      return h_flex().w_full().h(22).flex_none().px(6).gap(6).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
+        .child(icon(open ? "chevron-down" : "chevron-right", 16).text_color(t.muted))
+        .child(typeIcon(FT, name, t))
+        .child(div().flex_none().max_w(220).truncate().child(name))
+        .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(t.dim).child(parts.join("/")))
+        .child(div().flex_none().px(6).h(16).flex().items_center().rounded(8).bg(t.raised).text_size(10.5).text_color(t.muted).child(String(row.file.hits.length)));
+    }
+    const at = this.findAt === `${row.file.path}:${row.hit.line}`;
+    return h_flex().w_full().h(22).flex_none().pl(30).pr(6).gap(8).items_center().rounded(5).cursor_pointer()
+      .when(at, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).font_family(settings().font_family ?? "JetBrains Mono").text_size(12)
+      .child(div().w(34).flex_none().text_right().text_size(11).text_color(t.dim).child(String(row.hit.line)))
+      .child(this.findText(row.hit.text, t));
+  }
+  searchBody(t) {
+    const rows = this.findRows(), f = this.found;
+    const summary = this.findNote ?? (this.finding && !f ? "Searching…" : f ? (f.count
+      ? `${f.count}${f.capped ? "+" : ""} result${f.count === 1 ? "" : "s"} in ${f.files.length} file${f.files.length === 1 ? "" : "s"}${f.capped ? " · showing the first 2,000" : ""}`
+      : "No results") : "Searches every file in the repo, changed or not (not what .gitignore hides)");
+    const option = (id, label, on, tip) => div().id(id).w(26).h(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+      .text_size(11.5).font_semibold().tooltip(tip).bg(on ? t.accent + "33" : t.background).text_color(on ? t.accent : t.muted).hover((s) => s.bg(t.hover))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.setFindOption(id, cx)).child(label);
+    return v_flex().flex_1().min_h(0)
+      .child(h_flex().id("find-box").mx(10).mt(4).h(32).flex_none().pl(8).pr(4).gap(4).items_center().rounded(6).border_1().border_color(t.accent).cursor_text()
+        .on_mouse_down("left", (_e, cx) => { cx.stop_propagation(); this.find.focus(); })
+        .child(icon("search", 14).text_color(t.muted))
+        .child(div().flex_1().min_w(0).h_full().flex().items_center().child(Input.new(this.find).h_full().text_size(12).text_color(t.foreground)))
+        .child(option("findCase", "Aa", this.findCase, "Match case"))
+        .child(option("findRegex", ".*", this.findRegex, "Regular expression")))
+      .child(h_flex().px(14).pt(6).pb(4).gap(6).items_center().text_size(11).text_color(this.findNote && f === null && this.query.length >= 2 ? t.ansi1 : t.dim)
+        .child(div().flex_1().min_w(0).truncate().child(summary))
+        .when(Boolean(this.finding && f), (e) => e.child(div().flex_none().child("searching…"))))
+      .child(div().flex_1().min_h(0).relative().border_t(1).border_color(t.border)
+        .child(v_virtual_list("find-rows", rows.length, 22, (i) => String(i),
+          (range) => rows.slice(range.start, range.end).map((row) => this.findRow(row, t))).size_full().p(6)
+          // The list refuses per-row handlers: a row's click is the list's.
+          .on_item_click((key, cx) => {
+            const row = this.findRows()[Number(key)];
+            if (!row) return;
+            if (row.hit) this.openFound(row.file, row.hit, cx);
+            else { if (this.foundFolded.has(row.file.path)) this.foundFolded.delete(row.file.path); else this.foundFolded.add(row.file.path); this.foldVer = (this.foldVer ?? 0) + 1; cx.notify(); }
+          }))
+        .child(Scrollbar.vertical("find-rows").viewport_from_layout().absolute().inset_0()));
+  }
+
   render(cx) {
     this.trackSessions(cx);
     if (this.key() !== this.context) this.refresh(cx);
@@ -821,7 +978,7 @@ export default class Changes extends View {
       for (const row of items) rows.push({ ...row, in: g.id });
     }
     const empty = this.error || (this.loading ? "Loading changes…" : !this.root ? "No folder" : this.mode === "session" ? "This session hasn't changed anything yet" : "No changes");
-    return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
+    const root = v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_size_change((size, cx) => { if (Math.abs(size.height - this.panelH) > 1) { this.panelH = size.height; cx.notify(); } })
       // Dragging the line between the list and the diff: pressed on the line, moved anywhere.
       .on_mouse_move((e, cx) => {
@@ -833,22 +990,32 @@ export default class Changes extends View {
       .on_hover((hovered, cx) => { if (!hovered) this.endResize(cx); })
       .on_key_down((e, cx) => {
         if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
-      })
-      .child(h_flex().h(38).flex_none().pl(14).pr(8).gap(8).items_center()
-        .child(div().text_size(11).font_semibold().text_color(t.muted).child("CHANGES"))
-        .child(h_flex().p(2).gap(2).rounded(7).border_1().border_color(t.border)
+        else if (e.key === "escape" && this.searching) { this.setSearching(false, cx); cx.stop_propagation(); }
+        else if (e.key === "f" && (e.modifiers?.control || e.modifiers?.platform) && e.modifiers?.shift) { this.setSearching(true, cx); cx.stop_propagation(); }
+      });
+    const header = h_flex().h(38).flex_none().pl(14).pr(8).gap(8).items_center()
+        .child(div().text_size(11).font_semibold().text_color(t.muted).child(this.searching ? "SEARCH" : "CHANGES"))
+        .when(!this.searching, (e) => e.child(h_flex().p(2).gap(2).rounded(7).border_1().border_color(t.border)
           .child(this.pill("mode-session", "Session", this.mode === "session", (cx) => this.setMode("session", cx), t))
-          .child(this.pill("mode-all", "All", this.mode === "all", (cx) => this.setMode("all", cx), t)))
+          .child(this.pill("mode-all", "All", this.mode === "all", (cx) => this.setMode("all", cx), t))))
         .child(div().flex_1())
-        .when(!this.preview, (e) => e.child(div().id("preview-on").size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+        // Search in all files; again (or Esc) goes back to the changes.
+        .child(div().id("find-toggle").size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+          .tooltip(this.searching ? "Back to changes (Esc)" : "Search in all files")
+          .bg(this.searching ? t.accent + "33" : t.background).text_color(this.searching ? t.accent : t.muted).hover((s) => s.bg(t.hover))
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.setSearching(!this.searching, cx))
+          .child(icon("search", 16)))
+        .when(!this.searching && !this.preview, (e) => e.child(div().id("preview-on").size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
           .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.setPreview(true, cx))
           .child(svg("mods/diff-view/split.svg").size(16))))
-        .child(this.iconButton("view", this.tree ? "list-flat" : "list-tree", (cx) => this.toggleTree(cx), t))
+        .when(!this.searching, (e) => e.child(this.iconButton("view", this.tree ? "list-flat" : "list-tree", (cx) => this.toggleTree(cx), t)))
         // The repo's history as a graph (mods/git-graph); only in a git repository.
-        .when(Boolean(this.root), (e) => e.child(this.iconButton("graph", "graph", () =>
+        .when(!this.searching && Boolean(this.root), (e) => e.child(this.iconButton("graph", "graph", () =>
           openOverlay({ mod: "git-graph", kind: "dialog", width: 0.94, height: 0.92, props: { root: this.root, on: this.on } }), t)))
-        .child(this.iconButton("refresh", "refresh", (cx) => this.refresh(cx), t)))
+        .child(this.iconButton("refresh", "refresh", (cx) => this.searching ? this.search(cx) : this.refresh(cx), t));
+    if (this.searching) return root.child(header).child(this.searchBody(t));
+    return root.child(header)
       // Which pane the panel follows: with several terminals or agents in a tab, the focused one.
       .when(Boolean(following), (el) => el.child(h_flex().h(22).flex_none().px(14).gap(6).items_center().text_size(11).text_color(t.dim)
         .when(Boolean(followIcon), (e) => e.child(followIcon))

@@ -154,7 +154,9 @@ export default class DiffView extends View {
     this.handle = cx.focus_handle(); this.scroll = VirtualListScrollHandle.new();
     try { this.split = localStorage.getItem("split") !== "inline"; } catch { this.split = true; }
     try { this.full = localStorage.getItem("full") === "full"; } catch { this.full = false; }
-    this.width = 1200; this.change = -1;
+    // Opened on a line (a search result: files[i].line): the whole file, there. Not remembered.
+    if (this.files[this.index]?.line) this.full = true;
+    this.width = 1200; this.change = -1; this.hit = null;
     // Where the line between the sides sits, as a share of the width: dragged, remembered.
     try { this.ratio = Math.min(0.85, Math.max(0.15, Number(localStorage.getItem("ratio")) || 0.5)); } catch { this.ratio = 0.5; }
     this.ed = null; this.saved = null; this.editNote = null; this.conflict = false; this.leaving = false;
@@ -257,7 +259,8 @@ export default class DiffView extends View {
         // A loop, not Math.max(...rows): a spread of a huge file's rows overflows the stack.
         this.longest = this.rows.reduce((m, row) => Math.max(m, row.l?.text.length ?? 0, row.r?.text.length ?? 0), 20);
         this.build();
-        if (first && this.blocks.length) { this.change = 0; this.jump(cx); }
+        if (first && f.line) this.reveal(f, cx);
+        else if (first && this.blocks.length) { this.change = 0; this.jump(cx); }
         else if (this.change >= this.blocks.length) this.change = this.blocks.length - 1;
       } catch (e) { if (seq === this.seq) this.note = `Cannot compare: ${e?.message ?? e}`; }
       finally { if (seq === this.seq) this.loading = false; cx.notify(); }
@@ -317,6 +320,18 @@ export default class DiffView extends View {
     this.scroll.scroll_to_item(Math.max(0, this.lineOf(this.blocks[this.change]) - 3), "top");
     cx.notify();
   }
+  // Scrolls to a file's line (on the working-tree side) and marks it.
+  reveal(f, cx) {
+    const at = (this.items ?? []).findIndex((it) => it.row?.r?.n === f.line);
+    if (at < 0) return;
+    this.hit = { path: f.path, line: f.line };
+    let n = this.lineOf(at);
+    // Inline, a changed row draws its − line first: the + line is the one.
+    if (!this.split && this.items[at].row.kind === "change" && this.items[at].row.l) n++;
+    this.scroll.scroll_to_item(Math.max(0, n - 8), "top");
+    cx.notify();
+  }
+  isHit(cell) { return Boolean(this.hit && cell && cell.n === this.hit.line && this.file()?.path === this.hit.path); }
   step(by, cx) {
     if (!this.blocks?.length) return;
     this.change = Math.min(this.blocks.length - 1, Math.max(0, (this.change < 0 ? (by > 0 ? -1 : 0) : this.change) + by));
@@ -327,7 +342,9 @@ export default class DiffView extends View {
     if (this.dirty()) { this.editNote = "Save or discard your edits before opening another file"; cx.notify(); return; }
     const wasEditing = this.editing();
     if (wasEditing) { this.ed?.release(); this.ed = null; this.saved = null; this.editNote = null; }
-    this.index = index; this.load(cx, true);
+    this.index = index; this.hit = null;
+    if (this.files[index].line && !this.full) this.full = true;
+    this.load(cx, true);
     if (wasEditing && this.canEdit()) this.startEdit(cx);
   }
 
@@ -395,11 +412,12 @@ export default class DiffView extends View {
 
   // One side of a row: number and sign together, then code. kind: "same", "-", "+", or "gap"
   // (nothing on this side). cur: the change the counter is on: brighter rows and an accent edge.
-  half(cell, kind, width, t, cur = false) {
+  // hit: the line a search opened this on: a yellow tint and edge.
+  half(cell, kind, width, t, cur = false, hit = false) {
     const v = this.look(t), changed = kind === "+" || kind === "-";
-    const bg = kind === "+" ? (cur ? v.addCur : v.add) : kind === "-" ? (cur ? v.delCur : v.del) : null;
+    const bg = hit ? t.ansi3 + "38" : kind === "+" ? (cur ? v.addCur : v.add) : kind === "-" ? (cur ? v.delCur : v.del) : null;
     const el = h_flex().h_full().flex_none().w(width).items_center().overflow_hidden()
-      .child(div().w(3).h_full().flex_none().when(cur, (e) => e.bg(t.accent)));
+      .child(div().w(3).h_full().flex_none().when(cur || hit, (e) => e.bg(hit ? t.ansi3 : t.accent)));
     if (kind === "gap") return el.bg(cur ? t.accent + "1c" : t.raised + "50");
     return el.when(Boolean(bg), (e) => e.bg(bg))
       .child(div().w(40).h_full().flex_none().pr(4).flex().items_center().justify_end().text_color(changed ? v.changedNumber : v.number).child(String(cell.n)))
@@ -416,14 +434,14 @@ export default class DiffView extends View {
     }
     const { row } = it, cur = it.block !== undefined && it.block >= 0 && it.block === this.change;
     if (!this.split) {
-      if (row.kind === "same") return h_flex().w_full().h(ROW).flex_none().child(this.half(row.r, "same", lw + rw + 1, t));
-      return h_flex().w_full().h(ROW).flex_none().child(this.half(row[it.side], it.side === "l" ? "-" : "+", lw + rw + 1, t, cur));
+      if (row.kind === "same") return h_flex().w_full().h(ROW).flex_none().child(this.half(row.r, "same", lw + rw + 1, t, false, this.isHit(row.r)));
+      return h_flex().w_full().h(ROW).flex_none().child(this.half(row[it.side], it.side === "l" ? "-" : "+", lw + rw + 1, t, cur, it.side === "r" && this.isHit(row.r)));
     }
     const same = row.kind === "same";
     return h_flex().w_full().h(ROW).flex_none()
       .child(this.half(row.l, same ? "same" : row.l ? "-" : "gap", lw, t, cur))
       .child(div().w(1).h_full().flex_none().bg(cur ? t.accent : t.border))
-      .child(this.half(row.r, same ? "same" : row.r ? "+" : "gap", rw, t, cur));
+      .child(this.half(row.r, same ? "same" : row.r ? "+" : "gap", rw, t, cur, this.isHit(row.r)));
   }
 
   // color: the icon's own color (what the button does), dim while disabled.
