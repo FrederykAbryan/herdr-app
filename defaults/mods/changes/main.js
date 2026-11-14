@@ -231,7 +231,7 @@ export default class Changes extends View {
     try { this.preview = localStorage.getItem("preview") !== "off"; } catch { this.preview = true; }
     // The file list's height when dragged (the line above the diff); null: as tall as its rows.
     try { const h = Number(localStorage.getItem("listHeight")); this.listH = h > 0 ? h : null; } catch { this.listH = null; }
-    this.panelH = 800; this.listMeasured = 200;
+    this.panelH = 800; this.listMeasured = 200; this.genSeq = 0; this.msgW = 0;
     this.input = InputState.new({ placeholder: "Message (Enter to commit)" });
     this.input.on("change", (_e, cx) => {
       const hadMessage = Boolean(this.message.trim());
@@ -695,7 +695,7 @@ export default class Changes extends View {
   // Commits what's staged, like `git commit`. In Session mode the session's committed files
   // then leave its list.
   commit(cx) {
-    if (!this.message.trim() || !this.root || this.busy || this.loading || this.context !== this.key()) return;
+    if (!this.message.trim() || !this.root || this.busy || this.loading || this.generating || this.context !== this.key()) return;
     const staged = this.group("staged"), outside = this.group("outside");
     if (!staged.length && !outside.length) { this.note = "Nothing is staged: stage files with + first"; cx.notify(); return; }
     const reverted = [...staged, ...outside].filter((f) => f.reverted).map((f) => f.path);
@@ -724,17 +724,52 @@ export default class Changes extends View {
     if (!staged && !this.group("changes").length) return;
     const context = this.context, root = this.root, on = this.on;
     const args = staged ? ["cached", "", ""] : this.trees ? ["range", this.trees.base, this.trees.now] : ["all", "", ""];
-    this.generating = true; this.note = null;
+    // genSeq: Cancel (or a newer run) makes this one's answer stale; exec can't be killed,
+    // so the program finishes in the background and its answer is dropped.
+    const seq = ++this.genSeq;
+    this.generating = true; this.genDone = false; this.note = null;
     cx.spawn(async (cx) => {
       try {
         const r = await exec("sh", ["-c", GENERATE, "sh", root, ...args], { cwd: root, on, timeout: 120000 });
+        if (seq !== this.genSeq) return;
         const line = r.stdout.split("\n").map((l) => l.trim().replace(/^["'`]+|["'`]+$/g, "").trim()).filter(Boolean).pop();
         if (r.code !== 0 || !line) throw new Error(r.stderr.trim().split("\n").filter(Boolean).pop() || `exit code ${r.code}`);
-        if (this.key() === context) { this.message = line; this.input.set_value(line); }
-      } catch (e) { if (this.key() === context) this.note = `Could not write a message: ${e?.message ?? e}`; }
-      finally { this.generating = false; cx.notify(); }
+        if (this.key() === context) {
+          this.message = line; this.input.set_value(line); this.input.focus();
+          // A short green border says the message is in.
+          this.genDone = true;
+          cx.timer.after(1500, (cx) => { if (seq === this.genSeq) { this.genDone = false; cx.notify(); } });
+        }
+      } catch (e) { if (seq === this.genSeq && this.key() === context) this.note = `Could not write a message: ${e?.message ?? e}`; }
+      finally { if (seq === this.genSeq) { this.generating = false; cx.notify(); } }
     });
     cx.notify();
+  }
+
+  cancelGenerate(cx) {
+    if (!this.generating) return;
+    this.genSeq++; this.generating = false; this.genDone = false;
+    cx.notify();
+  }
+
+  // The message box while Generate runs: spinner, animated text, a cancel ×,
+  // and a bar sliding along the bottom edge. All native animation, no timers.
+  generatingBox(t) {
+    const w = this.msgW || 240, bar = Math.max(40, Math.round(w * 0.3));
+    return h_flex().id("commit-message").mx(10).mt(4).h(32).flex_none().pl(10).pr(4).gap(8).items_center().rounded(6)
+      .relative().overflow_hidden().border_1().border_color(t.accent).bg(t.accent + "14")
+      .on_size_change((s, cx) => { if (Math.round(s.width) !== this.msgW) { this.msgW = Math.round(s.width); cx.notify(); } })
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .child(svg("mods/workspace-chrome/spinner.svg").size(13).flex_none().text_color(t.accent).spin(900))
+      .child(h_flex().flex_1().min_w(0).items_center().text_size(12).text_color(t.muted)
+        .child(div().truncate().child("Writing commit message"))
+        .child(div().w(16).flex_none().frames(["", ".", "..", "..."], 380).child("")))
+      .child(div().id("generate-cancel").size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+        .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_click((_e, cx) => this.cancelGenerate(cx)).tooltip("Cancel")
+        .child(svg("mods/workspace-chrome/x.svg").size(14)))
+      .child(div().absolute().bottom(0).left(0).h(2).w(bar).rounded(1).bg(t.accent)
+        .loop("left", { from: -bar, to: w, period: 1400 }));
   }
 
   // Rows show their buttons while the pointer is on them, as editors do.
@@ -1003,7 +1038,7 @@ export default class Changes extends View {
     const followIcon = prog?.icon ? (prog.tint ? svg(prog.icon).size(12).flex_none().text_color(t.muted) : image(prog.icon).size(12).flex_none()) : null;
     const following = repo ? [prog?.name || (fpane?.terminal ? "Terminal" : null), repo, session?.root ? `since ${since}${session.live ? "" : " (ended)"}` : null].filter(Boolean).join(" · ") : null;
     const staged = this.group("staged").length + this.group("outside").length, total = this.groups.reduce((n, g) => n + g.items.length, 0);
-    const canCommit = Boolean(this.message.trim() && staged && this.root && !this.busy && !this.loading);
+    const canCommit = Boolean(this.message.trim() && staged && this.root && !this.busy && !this.loading && !this.generating);
     const rows = [];
     for (const g of this.groups) {
       rows.push({ group: g });
@@ -1057,16 +1092,16 @@ export default class Changes extends View {
         .child(div().flex_1().min_w(0).truncate().child(following))
         .when(Boolean(session?.root), (e) => e.child(div().id("session-restart").px(6).rounded(4).cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
           .on_click((_e, cx) => this.restart(cx)).child("Start over")))))
-      .child(h_flex().id("commit-message").mx(10).mt(4).h(32).flex_none().pl(10).pr(4).gap(4).items_center().rounded(6).border_1().border_color(this.typing ? t.accent : t.border).cursor_text()
+      .child(this.generating ? this.generatingBox(t) : h_flex().id("commit-message").mx(10).mt(4).h(32).flex_none().pl(10).pr(4).gap(4).items_center().rounded(6).border_1()
+        .border_color(this.genDone ? t.ansi2 : this.typing ? t.accent : t.border).cursor_text()
+        .on_size_change((s, cx) => { if (Math.round(s.width) !== this.msgW) { this.msgW = Math.round(s.width); cx.notify(); } })
         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .child(div().flex_1().min_w(0).h_full().flex().items_center().child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
-        .child(this.generating
-          ? div().w(22).flex_none().flex().justify_center().text_color(t.dim).child("…")
-          : this.iconButton("generate", "sparkle", (cx) => this.generate(cx), t)))
+        .child(this.iconButton("generate", "sparkle", (cx) => this.generate(cx), t).tooltip("Generate commit message")))
       .child(h_flex().id("commit").mx(10).mt(8).h(30).flex_none().gap(6).items_center().justify_center().rounded(6).text_size(13)
         .bg(canCommit ? t.solid : t.raised).text_color(canCommit ? t.solid_foreground : t.dim).when(canCommit, (e) => e.cursor_pointer())
         .on_click((_e, cx) => this.commit(cx))
-        .child(icon("check", 16)).child(this.busy ? "Working…" : "Commit"))
+        .child(icon("check", 16)).child(this.busy ? "Working…" : this.generating ? "Waiting for message…" : "Commit"))
       .when(total > 0, (el) => el.child(div().px(14).pt(4).text_size(11).text_color(t.dim)
         .child(staged ? `${staged} staged${this.group("outside").length ? ` · ${this.group("outside").length} from outside this session` : ""}` : "Nothing staged · stage files with +")))
       // Discard asks here first, as VS Code's dialog does: it can't be undone.
