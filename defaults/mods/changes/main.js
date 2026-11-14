@@ -463,7 +463,7 @@ export default class Changes extends View {
     const { cwd, on } = location(), context = this.key();
     if (context !== this.context) {
       this.context = context; this.root = null; this.groups = []; this.open = null; this.trees = null;
-      this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false;
+      this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false; this.confirming = null;
     }
     if (!cwd) return;
     this.loading = true;
@@ -660,6 +660,38 @@ export default class Changes extends View {
     if (paths.length) this.gitAction(this.hasHead ? ["restore", "--staged", "--", ...paths] : ["rm", "--cached", "-r", "-q", "--", ...paths], cx);
   }
 
+  // Discard, as VS Code's ↺ on Changes: the working copy goes back to the index (to HEAD if
+  // nothing is staged), and new untracked files are deleted. Asks first: it can't be undone.
+  discard(paths, label, cx) {
+    const items = this.group("changes").filter((f) => paths.includes(f.path));
+    if (!items.length || !this.root || this.busy) return;
+    this.confirming = { items, label }; this.note = null;
+    cx.notify();
+  }
+  discardNow(cx) {
+    const ask = this.confirming;
+    this.confirming = null;
+    if (!ask || !this.root || this.busy) { cx.notify(); return; }
+    const root = this.root, on = this.on;
+    const conflicts = ask.items.filter((f) => f.status === "C").map((f) => f.path);
+    const fresh = ask.items.filter((f) => f.fresh).map((f) => f.path);
+    const tracked = ask.items.filter((f) => !f.fresh && f.status !== "C").map((f) => f.path);
+    this.busy = true; this.note = null;
+    cx.spawn(async (cx) => {
+      try {
+        const git = async (args) => {
+          const r = await exec("git", ["--literal-pathspecs", ...args], { cwd: root, on });
+          if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+        };
+        if (tracked.length) await git(["restore", "--worktree", "--", ...tracked]);
+        if (fresh.length) await git(["clean", "-f", "-q", "--", ...fresh]);
+        if (conflicts.length) this.note = `Not discarded (merge conflict, resolve first): ${conflicts.slice(0, 3).join(", ")}${conflicts.length > 3 ? ` +${conflicts.length - 3}` : ""}`;
+      } catch (e) { this.note = `Discard failed: ${e?.message ?? e}`; }
+      finally { this.busy = false; this.refresh(cx); cx.notify(); }
+    });
+    cx.notify();
+  }
+
   // Commits what's staged, like `git commit`. In Session mode the session's committed files
   // then leave its list.
   commit(cx) {
@@ -725,15 +757,17 @@ export default class Changes extends View {
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => click(cx)).child(label);
   }
 
-  // The + or − a row offers: stage what isn't staged, unstage what is.
-  rowAction(group, id, paths, t) {
-    if (group === "changes") return this.iconButton(`stage-${id}`, "add", (cx) => this.stage(paths, cx), t);
+  // The buttons a row offers: discard (↺) and stage (+) what isn't staged, unstage (−) what is.
+  rowAction(group, id, paths, t, label) {
+    if (group === "changes") return h_flex().flex_none().gap(2).items_center()
+      .child(this.iconButton(`discard-${id}`, "discard", (cx) => this.discard(paths, label, cx), t).tooltip("Discard changes"))
+      .child(this.iconButton(`stage-${id}`, "add", (cx) => this.stage(paths, cx), t).tooltip("Stage changes"));
     if (group === "staged" || group === "outside") return this.iconButton(`unstage-${id}`, "remove", (cx) => this.unstage(paths, cx), t);
     return null;
   }
 
   groupRow(g, t) {
-    const id = `group-${g.id}`, open = !this.collapsedGroups.has(g.id), action = this.hovered === id ? this.rowAction(g.id, id, g.items.map((f) => f.path), t) : null;
+    const id = `group-${g.id}`, open = !this.collapsedGroups.has(g.id), action = this.hovered === id ? this.rowAction(g.id, id, g.items.map((f) => f.path), t, `all ${g.items.length} file${g.items.length === 1 ? "" : "s"}`) : null;
     return this.hoverable(h_flex().id(id).h(24).flex_none().px(4).gap(4).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => this.toggle(this.collapsedGroups, g.id, cx))
       .child(icon(open ? "chevron-down" : "chevron-right", 16).text_color(t.muted))
@@ -744,7 +778,7 @@ export default class Changes extends View {
 
   dirRow(group, { dir, name, depth, paths }, t) {
     const id = `dir-${group}|${dir}`, key = `${group}:${dir}`, open = !this.collapsed.has(key);
-    const action = this.hovered === id ? this.rowAction(group, id, paths, t) : null;
+    const action = this.hovered === id ? this.rowAction(group, id, paths, t, `${paths.length} file${paths.length === 1 ? "" : "s"} in ${dir}`) : null;
     return this.hoverable(h_flex().id(id).h(24).flex_none().pl(20 + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => this.toggle(this.collapsed, key, cx))
       .child(icon(open ? "chevron-down" : "chevron-right", 16).text_color(t.muted))
@@ -756,7 +790,7 @@ export default class Changes extends View {
 
   fileRow(group, f, depth, t) {
     const key = `${group}|${f.path}`, parts = f.path.split("/"), name = parts.pop();
-    const action = this.hovered === key ? this.rowAction(group, key, [f.path], t) : null;
+    const action = this.hovered === key ? this.rowAction(group, key, [f.path], t, f.fresh ? `${name} (new file, will be deleted)` : name) : null;
     const compare = this.hovered === key ? div().id(`compare-${key}`).size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
       .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.compare(key, cx))
@@ -989,7 +1023,8 @@ export default class Changes extends View {
       .on_mouse_up("left", (_e, cx) => this.endResize(cx))
       .on_hover((hovered, cx) => { if (!hovered) this.endResize(cx); })
       .on_key_down((e, cx) => {
-        if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
+        if (e.key === "escape" && this.confirming) { this.confirming = null; cx.stop_propagation(); cx.notify(); }
+        else if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
         else if (e.key === "escape" && this.searching) { this.setSearching(false, cx); cx.stop_propagation(); }
         else if (e.key === "f" && (e.modifiers?.control || e.modifiers?.platform) && e.modifiers?.shift) { this.setSearching(true, cx); cx.stop_propagation(); }
       });
@@ -1034,6 +1069,17 @@ export default class Changes extends View {
         .child(icon("check", 16)).child(this.busy ? "Working…" : "Commit"))
       .when(total > 0, (el) => el.child(div().px(14).pt(4).text_size(11).text_color(t.dim)
         .child(staged ? `${staged} staged${this.group("outside").length ? ` · ${this.group("outside").length} from outside this session` : ""}` : "Nothing staged · stage files with +")))
+      // Discard asks here first, as VS Code's dialog does: it can't be undone.
+      .when(Boolean(this.confirming), (el) => el.child(v_flex().id("discard-confirm").mx(10).mt(8).p(8).gap(8).flex_none().rounded(6)
+        .border_1().border_color(t.ansi1).bg(t.ansi1 + "1a").text_size(12)
+        .child(div().text_color(t.foreground).child(`Discard changes in ${this.confirming.label}?`))
+        .child(div().text_size(11).text_color(t.muted).child("This can't be undone. Untracked files are deleted."))
+        .child(h_flex().gap(6).justify_end()
+          .child(this.pill("discard-cancel", "Cancel", false, (cx) => { this.confirming = null; cx.notify(); }, t))
+          .child(div().id("discard-yes").px(9).h(22).flex().items_center().rounded(5).text_size(11).cursor_pointer()
+            .bg(t.ansi1).text_color("#ffffff").hover((s) => s.opacity(0.88))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.discardNow(cx))
+            .child("Discard")))))
       // Tall enough for every row, plus the empty note (which can wrap) when there are none.
       .child(div().id("changes-list-box").mt(8).min_h(44).relative().border_t(1).border_color(t.border)
         .on_size_change((size) => { this.listMeasured = size.height; })
