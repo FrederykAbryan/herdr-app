@@ -4,8 +4,9 @@
 #
 #   changes   -> changes-focus   Changes panel: session focus, staging, tree, generate, diffs
 #   agents    -> agents-view     Agents sidebar: group / sort / hide idle
-#   tabs      -> tabs-plus       Tab bar: grid layouts and full screen
+#   tabs      -> tabs-plus       Tab bar: grid layouts, full screen, Run button (package.json scripts)
 #   pane-grid -> pane-grid       the grid menu (new)
+#   run-menu  -> run-menu        the Run button's script list (new)
 #   diff-view -> diff-view       side-by-side compare, opened from the Changes panel (new)
 #   git-graph -> git-graph       commit graph, opened from the Changes panel (new)
 #   workspace-status -> workspace-status-plus   status bar: click the branch to switch / create one
@@ -39,7 +40,10 @@ sed 's|^const SELF = "agents";|const SELF = "agents-view";|' "$src/agents/main.j
 
 clone tabs tabs-plus
 sed 's|mods/tabs/|mods/tabs-plus/|g' "$src/tabs/main.js" > "$home/mods/tabs-plus/main.js"
-cp "$src"/tabs/scm-*.svg "$src/tabs/CODICONS-LICENSE" "$home/mods/tabs-plus/"
+cp "$src"/tabs/scm-*.svg "$src"/tabs/run-*.svg "$src/tabs/run.js" "$src/tabs/CODICONS-LICENSE" "$home/mods/tabs-plus/"
+
+mkdir -p "$home/mods/run-menu"
+cp "$src"/run-menu/* "$home/mods/run-menu/"
 
 mkdir -p "$home/mods/pane-grid"
 cp "$src/pane-grid/main.js" "$src/pane-grid/mod.json" "$home/mods/pane-grid/"
@@ -65,7 +69,7 @@ cp -r "$src/files/mi" "$home/mods/files-plus/"
 clone menu menu-plus
 sed 's|^const SELF = "menu";|const SELF = "menu-plus";|' "$src/menu/main.js" > "$home/mods/menu-plus/main.js"
 
-for m in spaces-plus menu-plus files-plus changes-focus agents-view tabs-plus pane-grid diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
+for m in spaces-plus menu-plus files-plus changes-focus agents-view tabs-plus pane-grid run-menu diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
 
 # The layout: clone main once, then point its blocks at the personal mods.
 [ -f "$home/layouts/main-focus.json" ] || herdr-app do layout.clone '{"name":"main","as":"main-focus"}' >/dev/null

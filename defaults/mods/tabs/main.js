@@ -1,6 +1,7 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, setShared, layout, settings } from "herdr";
+import { spaces, panes, focused, run, openOverlay, theme, window, shared, setShared, layout, settings } from "herdr";
+import { discover, current, runningTab, start, stop as stopScript, show } from "./run.js";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -32,10 +33,31 @@ function toggleFullscreen() {
 }
 
 export default class Tabs extends View {
-  init() {
+  init(_props, cx) {
     this.pressed = null;
     this.scroll = ScrollHandle.new();
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
+    this.project = null;
+    this.detect(cx);
+    cx.timer.every(2500, (cx) => this.detect(cx));
+  }
+
+  // The focused pane's project for the Run button: looked up again when the pane's folder
+  // changes, and every 15 s (scripts added to package.json).
+  detect(cx) {
+    const space = spaces().find((s) => s.active), f = focused();
+    const pane = f?.pane ? panes().find((p) => p.pane === f.pane) : null;
+    const cwd = pane?.cwd || f?.cwd || space?.folder, on = space?.machine ?? null;
+    const key = JSON.stringify([cwd, on]);
+    if (!cwd || this.looking || (key === this.projectKey && Date.now() - this.looked < 15000)) return;
+    this.looking = true;
+    cx.spawn(async (cx) => {
+      try {
+        const info = await discover(cwd, on);
+        if (JSON.stringify(info) !== JSON.stringify(this.project)) { this.project = info; cx.notify(); }
+        this.projectKey = key; this.looked = Date.now();
+      } catch {} finally { this.looking = false; }
+    });
   }
 
   // The side panel is remembered per space: switching shows that space's choice
@@ -120,12 +142,34 @@ export default class Tabs extends View {
           else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
         }).child(svg(icon).size(14)).child(label);
     };
+    // Run: ▷ starts the project's script in its own tab (■ stops it while it runs), the name shows
+    // that tab, the chevron lists every script.
+    const info = this.project, c = info ? current(info) : null, live = c ? runningTab(info, c) : null;
+    const runColor = settings().dark === false ? { run: t.ansi2, stop: t.ansi1 } : { run: "#3fb950", stop: "#f85149" };
+    const runButton = () => h_flex().id("run").h(26).flex_none().items_center().rounded(6).border(1).border_color(t.border).text_size(12)
+      .child(div().id("run-go").h_full().pl(7).pr(5).flex().items_center().rounded(6).text_color(live ? runColor.stop : runColor.run)
+        .hover((s) => s.bg(t.hover)).on_mouse_down("left", stop)
+        .tooltip(live ? `Stop ${c.text}` : `Run ${c.text}`)
+        .on_click((_e, cx) => { if (live) stopScript(info, c); else cx.spawn(async () => { await start(info, c, space?.id); }); })
+        .child(svg(`mods/tabs/run-${live ? "stop" : "play"}.svg`).size(13)))
+      .child(div().id("run-name").h_full().pr(8).flex().items_center().gap(5).text_color(live ? t.foreground : t.muted)
+        .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_mouse_down("left", stop)
+        .tooltip(live ? `Show the ${c.label} tab` : `${info.kind}: ${c.text}`)
+        .on_click((_e, cx) => { if (live) show(info, c); else cx.spawn(async () => { await start(info, c, space?.id); }); })
+        .child(div().max_w(120).truncate().child(c.label.charAt(0).toUpperCase() + c.label.slice(1)))
+        .when(Boolean(live), (el) => el.child(div().size(6).rounded(3).bg(runColor.run))))
+      .child(div().w(1).h(14).bg(t.border))
+      .child(div().id("run-more").h_full().w(22).flex().items_center().justify_center().rounded(6).text_color(t.dim)
+        .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_mouse_down("left", stop).tooltip(`${info?.kind ?? ""} commands`)
+        .on_click(() => openOverlay({ mod: "run-menu", kind: "popup", width: 320, props: { info, space: space?.id } }))
+        .child(svg("mods/files/chevron-down.svg").size(12)));
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_up("left", () => { this.pressed = null; })
       .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().track_scroll(this.scroll)
         .on_size_change((_size, cx) => { if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
         .children(shown.map(item)))
+      .when(Boolean(c), el => el.child(runButton()).child(div().w(6).flex_none()))
       .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
       .child(button("pane-grid", svg("mods/tabs/scm-layout.svg").size(15), () => openOverlay({ mod: "pane-grid", kind: "popup", width: 392, height: 360 })).tooltip("Split into a grid"))
       .child(button("fullscreen", svg(`mods/tabs/scm-screen-${shared(FULL) ? "normal" : "full"}.svg`).size(15), toggleFullscreen)
