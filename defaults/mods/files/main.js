@@ -2,7 +2,7 @@
 // preview turns into an editor with Edit: ctrl+s saves, refusing if the file changed on disk.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, layout, run, shared, setShared } from "herdr";
 import { typeIcon, folderIcon } from "./filetypes.js";
 
 const FT = "mods/files";
@@ -38,6 +38,49 @@ const syntaxFor = (t) => settings().dark === false
       variable: "#ffa657", property: "#7ee787", operator: "#ff7b72" };
 const PER_FOLDER = 500, TOTAL = 5000;
 
+// ctrl+/ comments: `#` for shell-like languages, `--` for SQL/Lua, wrapped for markup and CSS, else `//`.
+const HASH = new Set(["bash", "sh", "python", "yaml", "properties", "make", "ruby", "r", "perl", "dockerfile", "nix", "elixir", "graphql", "gitignore", "editorconfig"]);
+const DASH = new Set(["sql", "lua", "haskell"]);
+const WRAP = { html: ["<!--", "-->"], xml: ["<!--", "-->"], svg: ["<!--", "-->"], md: ["<!--", "-->"], markdown: ["<!--", "-->"], css: ["/*", "*/"] };
+const commentFor = (path) => {
+  const l = langOf(path);
+  return HASH.has(l) ? ["#", ""] : DASH.has(l) ? ["--", ""] : WRAP[l] ?? ["//", ""];
+};
+// The whole lines a selection touches: [a, b) without the final newline. A selection that
+// ends at the start of a line (dragged down to it) leaves that line out, as in VS Code.
+const lineSpan = (text, r) => {
+  const s = Math.min(r.start, r.end), e = Math.max(r.start, r.end);
+  const last = e > s && text[e - 1] === "\n" ? e - 1 : e;
+  const a = s === 0 ? 0 : text.lastIndexOf("\n", s - 1) + 1;
+  const nl = text.indexOf("\n", last);
+  return { s, e, a, b: nl < 0 ? text.length : nl };
+};
+
+// Full screen for the Files panel: hides the sidebar, the panes and the status bar, lets the
+// panel take the whole width and maximizes the window, remembering what was shown (shared, so
+// it survives a restart) to put back exactly that.
+const FULL = "files.fullscreen";
+const HIDE = ["sidebar", "main", "status"];
+const findNode = (n, id) => !n ? null : n.id === id ? n : (n.children ?? []).reduce((f, c) => f ?? findNode(c, id), null);
+function setFullscreen(on) {
+  const root = layout(), was = shared(FULL);
+  if (on && !was) {
+    const saved = Object.fromEntries(HIDE.map((id) => [id, Boolean(findNode(root, id)) && !findNode(root, id).hidden]));
+    saved.panel = findNode(root, "panel")?.size ?? null;
+    saved.maximized = Boolean(window()?.maximized);
+    setShared(FULL, saved);
+    for (const id of HIDE) if (saved[id]) run("layout.hide", { id });
+    run("layout.resize", { id: "panel", weight: 1 });
+    if (!saved.maximized) run("window.maximize");
+  } else if (!on && was) {
+    setShared(FULL, null);
+    for (const id of HIDE) if (was[id]) run("layout.show", { id });
+    if (was.panel?.px) run("layout.resize", { id: "panel", px: was.panel.px });
+    else if (was.panel?.weight) run("layout.resize", { id: "panel", weight: was.panel.weight });
+    if (!was.maximized && window()?.maximized) run("window.maximize");
+  }
+}
+
 async function directory(path, on) {
   const windowsDirectory = async () => {
     // Windows PowerShell otherwise uses the console code page; exec decodes UTF-8.
@@ -68,7 +111,11 @@ export default class Files extends View {
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
     this.refresh(cx);
-    cx.timer.every(10000, cx => this.refresh(cx));
+    cx.timer.every(10000, cx => {
+      this.refresh(cx);
+      // The panel was closed while full screen (its tab-bar button): don't leave the panes hidden.
+      if (shared(FULL) && findNode(layout(), "panel")?.hidden) setFullscreen(false);
+    });
   }
 
   watch(root, cx) {
@@ -184,10 +231,52 @@ export default class Files extends View {
   setEditing(on, cx) {
     if (!this.canEdit() || on === this.editing) return;
     if (!on && this.dirty() && !this.leaving) { this.leaving = true; this.editNote = "Unsaved changes · click Done again to discard"; cx.notify(); return; }
+    // Keep the cursor/selection across the swap (a double-click's word stays selected).
+    let range = null;
+    try { range = this.code?.selected_range() ?? null; } catch {}
     this.code?.release();
     this.editing = on; this.leaving = false; this.conflict = false; this.editNote = null;
     this.code = this.editor(this.file, this.text, !on);
+    if (range) try { this.code.set_selected_range(range); } catch {}
+    if (on) this.code.focus();
     cx.notify();
+  }
+
+  // Replaces [a, b) as one undo step, then selects `sel`.
+  splice(a, b, text, sel) {
+    this.code.set_selected_range({ start: a, end: b });
+    this.code.replace(text);
+    this.code.set_selected_range(sel);
+  }
+
+  // ctrl+/: comment the touched lines, or uncomment them when every non-blank one is commented.
+  toggleComment() {
+    const text = this.code.value(), { s, e, a, b } = lineSpan(text, this.code.selected_range());
+    const [open, close] = commentFor(this.file);
+    const lines = text.slice(a, b).split("\n"), body = lines.filter((l) => l.trim());
+    if (!body.length) return;
+    const commented = (l) => { const t = l.trim(); return t.startsWith(open) && (!close || t.endsWith(close)); };
+    const uncomment = body.every(commented);
+    const indent = Math.min(...body.map((l) => l.match(/^\s*/)[0].length));
+    const out = lines.map((l) => {
+      if (!l.trim()) return l;
+      if (!uncomment) return l.slice(0, indent) + open + " " + l.slice(indent) + (close ? " " + close : "");
+      const i = l.indexOf(open);
+      let rest = l.slice(i + open.length).replace(/^ /, "");
+      if (close) { const j = rest.lastIndexOf(close); rest = rest.slice(0, j).replace(/ $/, "") + rest.slice(j + close.length); }
+      return l.slice(0, i) + rest;
+    }).join("\n");
+    const first = out.split("\n", 1)[0].length - lines[0].length, total = out.length - (b - a);
+    const start = Math.max(a, s + first);
+    this.splice(a, b, out, s === e ? { start, end: start } : { start, end: Math.max(start, e + total) });
+  }
+
+  // ctrl+shift+down / up: copy the touched lines below / above, the cursor going with the copy
+  // (down) or staying on the upper one (up), as VS Code's Copy Line Down / Up.
+  copyLines(down) {
+    const text = this.code.value(), { s, e, a, b } = lineSpan(text, this.code.selected_range());
+    const block = text.slice(a, b), d = down ? block.length + 1 : 0;
+    this.splice(b, b, "\n" + block, { start: s + d, end: e + d });
   }
 
   save(cx, force = false) {
@@ -221,7 +310,7 @@ export default class Files extends View {
     return div().id(id).size(24).flex().flex_none().items_center().justify_center().rounded(6).tooltip(tip)
       .text_color(enabled ? color ?? t.muted : color ? color + "66" : t.dim)
       .when(enabled, el => el.cursor_pointer().hover(s => s.bg(t.hover).text_color(color ?? t.foreground)))
-      .on_click((_e, cx) => { if (enabled) click(cx); }).child(svg(`mods/diff-view/${name}.svg`).size(15));
+      .on_click((_e, cx) => { if (enabled) click(cx); }).child(svg(name.includes("/") ? name : `mods/diff-view/${name}.svg`).size(15));
   }
 
   // A row's icon: a folder (open or shut), the file type's badge or glyph, else a plain page.
@@ -249,9 +338,16 @@ export default class Files extends View {
     if (key() !== this.context?.key) this.refresh(cx);
     const t = theme();
     const dirty = this.dirty();
+    const full = Boolean(shared(FULL)), canFull = full || Boolean(findNode(layout(), "panel"));
     return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .on_key_down((e, cx) => {
-        if (this.editing && e.key === "s" && (e.modifiers?.control || e.modifiers?.platform)) { this.save(cx); cx.stop_propagation(); }
+        const m = e.modifiers ?? {}, ctrl = m.control || m.platform;
+        if (this.editing && this.code && ctrl && !m.alt) {
+          if (e.key === "s" && !m.shift) { this.save(cx); cx.stop_propagation(); return; }
+          if (e.key === "/" && !m.shift) { this.toggleComment(); cx.stop_propagation(); cx.notify(); return; }
+          if (m.shift && (e.key === "down" || e.key === "up")) { this.copyLines(e.key === "down"); cx.stop_propagation(); cx.notify(); return; }
+        }
+        if (e.key === "escape" && !this.editing && full) { setFullscreen(false); cx.stop_propagation(); }
       })
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
         .when(Boolean(this.file), el => el.child(div().id("files-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => {
@@ -259,7 +355,9 @@ export default class Files extends View {
           this.show(null); cx.notify();
         }).child("←")))
         .child(div().font_semibold().child("Files"))
-        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? "")))
+        .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? ""))
+        .when(canFull, el => el.child(this.button("files-fullscreen", `${FT}/scm-screen-${full ? "normal" : "full"}.svg`,
+          full ? "Leave full screen (Esc)" : "Full screen", () => setFullscreen(!full), t, true, full ? tint(t).done : null))))
       .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
@@ -278,6 +376,11 @@ export default class Files extends View {
         .when(this.editing, el => el
           .child(this.button("files-save", "save", "Save (ctrl+s)", cx => this.save(cx), t, dirty && !this.saving, tint(t).save))
           .child(this.button("files-done", "check", "Done", cx => this.setEditing(false, cx), t, true, tint(t).done)))))
-      .when(Boolean(this.file), el => el.child(this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")));
+      // Double-click the preview to start editing, keeping the word it selected.
+      .when(Boolean(this.file), el => el.child(this.code
+        ? div().id("files-code").flex_1().min_h(0).flex().flex_col()
+          .on_mouse_down("left", (e, cx) => { if (!this.editing && e.click_count === 2 && this.canEdit()) this.setEditing(true, cx); })
+          .child(Editor.new(this.code).flex_1().min_h(0))
+        : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")));
   }
 }

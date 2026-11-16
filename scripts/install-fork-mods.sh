@@ -79,6 +79,9 @@ def walk(node):
         content = node.get("content")
         if isinstance(content, dict) and content.get("mod") in swap:
             content["mod"] = swap[content["mod"]]
+        # Files' full screen stretches the side panel over the whole window: no 900 px cap.
+        if node.get("id") == "panel":
+            node["max"] = 10000
         for value in node.values(): walk(value)
     elif isinstance(node, list):
         for value in node: walk(value)
