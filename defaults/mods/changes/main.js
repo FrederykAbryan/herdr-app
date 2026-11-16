@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, agents, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay } from "herdr";
+import { spaces, panes, focused, agents, terminals, machines, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay } from "herdr";
 import { typeIcon, folderIcon } from "./filetypes.js";
 
 function location() {
@@ -141,6 +141,65 @@ const SESSIONS = "changes.sessions";
 const ENDED_KEEP = 3 * 24 * 3600 * 1000;
 // A session as saved: session() adds its address on top.
 const record = ({ address: _a, ...rest }) => rest;
+// Which agent session runs in each Herdr terminal, for any agent CLI. A terminal's agent is
+// the first program under its shell(s) (processes carry HC_TERMINAL_ID). Its session id:
+// - Claude Code: ~/.claude/sessions/<pid>.json (checked against the start time: pids get reused);
+// - else the uuid of a session file it (or a child) holds open: Codex's sessions/…/rollout-<id>,
+//   Antigravity's presence/<id>.lock, Cursor's chats/…/<id>/store.db, and the like;
+// - else the process itself ("proc:"): a new process is a new session. Codex in daemon mode
+//   lands here, as its thread lives in the shared daemon.
+// Prints {"t35": {"id": "claude:<id>", "pid": 49301}}.
+const AGENT_SESSIONS = String.raw`
+import glob, json, os, re
+SHELLS = {"bash", "sh", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "xonsh", "elvish"}
+SESSION = re.compile(r"/(?:sessions?|session-state|chats?|conversations?|threads?|presence|brain)/(?:[^/]*/)*?[^/]*?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+procs = {}
+for p in os.listdir("/proc"):
+    if not p.isdigit(): continue
+    try:
+        t = next((e[15:].decode() for e in open(f"/proc/{p}/environ", "rb").read().split(b"\0") if e.startswith(b"HC_TERMINAL_ID=")), None)
+        if not t: continue
+        s = open(f"/proc/{p}/stat").read()
+        f = s.rsplit(")", 1)[1].split()
+        procs[int(p)] = {"term": t, "ppid": int(f[1]), "start": f[19], "name": s[s.index("(") + 1:s.rindex(")")]}
+    except Exception: pass
+kids = {}
+for pid, p in procs.items(): kids.setdefault(p["ppid"], []).append(pid)
+def shell(pid): return procs[pid]["name"] in SHELLS
+def tree(pid):
+    yield pid
+    for k in kids.get(pid, []): yield from tree(k)
+# The agent: a non-shell process whose ancestors in its terminal are all shells; the newest wins.
+agents = {}
+for pid, p in procs.items():
+    if shell(pid): continue
+    up = p["ppid"]
+    while up in procs and procs[up]["term"] == p["term"] and shell(up): up = procs[up]["ppid"]
+    if up in procs and procs[up]["term"] == p["term"]: continue
+    cur = agents.get(p["term"])
+    if cur is None or int(p["start"]) > int(procs[cur]["start"]): agents[p["term"]] = pid
+claude = {}
+for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+    try:
+        j = json.load(open(f)); pid = int(j["pid"])
+        if pid in procs and j.get("sessionId") and str(j.get("procStart") or procs[pid]["start"]) == procs[pid]["start"]: claude[pid] = j["sessionId"]
+    except Exception: pass
+out = {}
+for t, pid in agents.items():
+    sid = None
+    for q in tree(pid):
+        if q in claude: sid = "claude:" + claude[q]; break
+    if not sid:
+        for q in tree(pid):
+            try:
+                for fd in os.listdir(f"/proc/{q}/fd"):
+                    m = SESSION.search(os.readlink(f"/proc/{q}/fd/{fd}"))
+                    if m: sid = procs[pid]["name"] + ":" + m.group(1); break
+            except Exception: pass
+            if sid: break
+    out[t] = {"id": sid or "proc:%s:%d:%s" % (procs[pid]["name"], pid, procs[pid]["start"]), "pid": pid}
+print(json.dumps(out))
+`;
 const hash = (s) => { let h = 5381; for (const c of s) h = (h * 33 + c.codePointAt(0)) >>> 0; return h.toString(36); };
 
 // Tree view: folders first, then files, each by name. A folder holding only one folder shows as
@@ -322,7 +381,7 @@ export default class Changes extends View {
     return r.stdout.trim();
   }
 
-  baseline(agent, cx) {
+  baseline(agent, cx, agentSession = null, agentPid = null) {
     const pane = panes().find((p) => p.pane === agent.pane);
     if (!pane?.cwd) return;
     const on = spaces().find((s) => s.id === agent.space)?.machine ?? null, address = agent.address;
@@ -334,25 +393,93 @@ export default class Changes extends View {
         const root = top.code === 0 ? top.stdout.trim() : null;
         const tree = root ? await this.snapshot(root, on) : null;
         const head = root ? await exec("git", ["rev-parse", "-q", "--verify", "HEAD"], { cwd: root, on }) : null;
-        value = { root, on, tree, head: head?.code === 0 ? head.stdout.trim() : null, paths: [], live: true, at: Date.now() };
-      } catch (e) { value = { root: null, on, tree: null, live: true, at: Date.now(), error: String(e) }; }
+        value = { root, on, tree, head: head?.code === 0 ? head.stdout.trim() : null, paths: [], live: true, at: Date.now(), ...(agentSession ? { agentSession, agentPid } : {}) };
+      } catch (e) { value = { root: null, on, tree: null, live: true, at: Date.now(), error: String(e), ...(agentSession ? { agentSession, agentPid } : {}) }; }
       finally { this.pending.delete(address); }
       this.saveSession(address, value);
       cx.notify();
     });
   }
 
-  // Takes a snapshot for every agent that has none, and marks the ones that went away as ended
-  // (kept a few days so a finished session can still be reviewed; it starts over if it returns).
+  // Each agent's own session id, per terminal address ({} until first read; see AGENT_SESSIONS).
+  loadAgentSessions(cx) {
+    if (this.idsLoading) return;
+    const ons = [...new Set(agents().map((a) => spaces().find((s) => s.id === a.space)?.machine ?? null))];
+    this.idsLoading = true;
+    cx.spawn(async () => {
+      const ids = {};
+      try {
+        for (const on of ons) {
+          let map = {};
+          try { const r = await exec("python3", ["-c", AGENT_SESSIONS], { on, timeout: 10000 }); if (r.code === 0) map = JSON.parse(r.stdout || "{}"); } catch {}
+          for (const [t, id] of Object.entries(map)) ids[on ? `${on}/${t}` : t] = id;
+        }
+        this.ids = ids;
+      } finally { this.idsLoading = false; }
+    });
+  }
+
+  // A Changes session lives as long as the agent's own session, for every agent CLI (see
+  // AGENT_SESSIONS): the same session resumed (after a logout, an app restart, `--resume`,
+  // even in another terminal) keeps it; a new one (a fresh start, /clear) starts over.
+  // Agents with no session file to read count their process as the session.
+  // Ended sessions are kept a few days to review, and to pick up again if resumed.
   trackSessions(cx) {
-    const live = agents(), saved = shared(SESSIONS) ?? {};
-    // A live session saved before files were credited per agent (no paths) starts over once.
-    for (const a of live) if ((!saved[a.address]?.live || !Array.isArray(saved[a.address].paths)) && !this.pending.has(a.address)) this.baseline(a, cx);
-    const gone = Object.keys(saved).filter((a) => saved[a].live && !live.some((x) => x.address === a));
-    if (gone.length) cx.spawn(async (cx) => {
-      const next = { ...(shared(SESSIONS) ?? {}) };
-      for (const a of gone) if (next[a]?.live && !agents().some((x) => x.address === a)) next[a] = { ...next[a], live: false, ended: Date.now() };
+    this.loadAgentSessions(cx);
+    if (!this.ids || this.tracking) return;
+    const live = agents(), saved = shared(SESSIONS) ?? {}, ids = this.ids, now = Date.now(), ops = [];
+    for (const a of live) {
+      if (this.pending.has(a.address)) continue;
+      const s = saved[a.address], { id, pid } = ids[a.address] ?? {};
+      if (id) {
+        if (s?.agentSession === id) { if (!s.live) ops.push(["revive", a.address]); else if (!Array.isArray(s.paths)) ops.push(["fresh", a, id, null, pid]); continue; }
+        // Recorded before its id was known (no id yet, or only its process while the agent
+        // hadn't written its session file): it's this session.
+        const provisional = !s?.agentSession || (s.agentSession.startsWith("proc:") && !id.startsWith("proc:") && s.agentPid === pid);
+        if (s?.live && provisional && Array.isArray(s.paths)) { ops.push(["adopt", a.address, id, null, pid]); continue; }
+        const from = id.startsWith("proc:") ? null
+          : Object.keys(saved).find((k) => k !== a.address && saved[k].agentSession === id && saved[k].tree && !(saved[k].live && ids[k]?.id === id));
+        ops.push(from ? ["claim", a, id, from] : ["fresh", a, id, null, pid]);
+        continue;
+      }
+      // A live session saved before files were credited per agent (no paths) starts over once.
+      if (!s?.live || !Array.isArray(s.paths)) ops.push(["fresh", a, null]);
+    }
+    // While the app is still connecting (just started, after a login) the lists are empty or
+    // partial, so an agent counts as gone only once it has been missing for a while.
+    const ready = terminals().length > 0 && machines().every((m) => m.layout !== "loading");
+    this.missing ??= {};
+    for (const [k, s] of Object.entries(saved)) {
+      if (!s.live || live.some((x) => x.address === k)) { delete this.missing[k]; continue; }
+      if (!ready) continue;
+      this.missing[k] ??= now;
+      if (now - this.missing[k] >= 15000) { ops.push(["end", k]); delete this.missing[k]; }
+    }
+    if (!ops.length) return;
+    this.tracking = true;
+    for (const op of ops) if (op[0] === "fresh" || op[0] === "claim") this.pending.add(op[1].address);
+    cx.spawn(async (cx) => {
+      const next = { ...(shared(SESSIONS) ?? {}) }, fresh = [];
+      // The session a terminal had before a new one replaced it: kept (ended) under its id.
+      const archive = (k) => {
+        const s = next[k];
+        delete next[k];
+        if (s?.agentSession && s.tree) next[`${k}~${s.agentSession}`] = { ...s, live: false, ended: s.ended ?? Date.now() };
+      };
+      for (const [kind, x, id, from, pid] of ops) {
+        if (kind === "end") { if (next[x]?.live) next[x] = { ...next[x], live: false, ended: Date.now() }; }
+        else if (kind === "revive") { if (next[x]) { const { ended: _e, ...rest } = next[x]; next[x] = { ...rest, live: true }; } }
+        else if (kind === "adopt") { if (next[x]) next[x] = { ...next[x], agentSession: id, agentPid: pid }; }
+        else if (kind === "claim" && next[from]) {
+          const { ended: _e, ...rest } = next[from];
+          archive(x.address); delete next[from];
+          next[x.address] = { ...rest, live: true, paths: rest.paths ?? [] };
+          this.pending.delete(x.address);
+        } else { archive(x.address); fresh.push([x, id, pid]); }
+      }
       setShared(SESSIONS, next);
+      this.tracking = false;
+      for (const [a, id, pid] of fresh) { this.pending.delete(a.address); this.baseline(a, cx, id, pid); }
       cx.notify();
     });
   }
