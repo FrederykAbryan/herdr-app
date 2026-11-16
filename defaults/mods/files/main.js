@@ -110,6 +110,9 @@ export default class Files extends View {
   init(_props, cx) {
     this.saved = new Map();
     this.entries = new Map(); this.folders = new Set(); this.pending = new Set(); this.marks = {};
+    // Full screen with a file open: the tree stays on the left at this width (drag the line).
+    try { const w = Number(localStorage.getItem("treeWidth")); this.treeW = w > 0 ? w : 320; } catch { this.treeW = 320; }
+    this.width = 1200; this.drag = null;
     this.refresh(cx);
     cx.timer.every(10000, cx => {
       this.refresh(cx);
@@ -324,7 +327,14 @@ export default class Files extends View {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
-        .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
+        .when(!entry.dir && path === this.file, el => el.bg(t.selected))
+        .on_click((_e, cx) => {
+          if (entry.dir) return this.toggle(path, cx);
+          if (path === this.file) return;
+          // Beside an open editor: don't drop unsaved edits by opening another file.
+          if (this.dirty()) { this.editNote = "Save or discard your edits first"; this.leaving = false; cx.notify(); return; }
+          this.show(path, cx);
+        })
         .child(entry.dir ? svg(`mods/files/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(this.icon(entry, open, t))
         .child(div().flex_1().min_w(0).truncate().child(entry.name))
@@ -339,7 +349,22 @@ export default class Files extends View {
     const t = theme();
     const dirty = this.dirty();
     const full = Boolean(shared(FULL)), canFull = full || Boolean(findNode(layout(), "panel"));
+    const split = full && Boolean(this.file);
+    const treeW = Math.round(Math.min(Math.max(160, this.treeW), Math.max(160, this.width - 280)));
+    const tree = v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
+      .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
+      .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")));
+    const fileView = this.file ? this.fileView(t, dirty) : null;
     return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
+      .on_size_change((size, cx) => { if (Math.abs(size.width - this.width) > 1) { this.width = size.width; cx.notify(); } })
+      // Dragging the line between the tree and the file: pressed on the line, moved anywhere.
+      .on_mouse_move((e, cx) => {
+        if (!this.drag) return;
+        this.treeW = Math.round(Math.min(Math.max(160, this.width - 280), Math.max(160, this.drag.w + e.position.x - this.drag.x)));
+        cx.notify();
+      })
+      .on_mouse_up("left", (_e, cx) => this.endDrag(cx))
+      .on_hover((hovered, cx) => { if (!hovered) this.endDrag(cx); })
       .on_key_down((e, cx) => {
         const m = e.modifiers ?? {}, ctrl = m.control || m.platform;
         if (this.editing && this.code && ctrl && !m.alt) {
@@ -358,11 +383,33 @@ export default class Files extends View {
         .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(this.file ?? this.root?.split(/[\\/]/).pop() ?? ""))
         .when(canFull, el => el.child(this.button("files-fullscreen", `${FT}/scm-screen-${full ? "normal" : "full"}.svg`,
           full ? "Leave full screen (Esc)" : "Full screen", () => setFullscreen(!full), t, true, full ? tint(t).done : null))))
-      .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
-        .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
-        .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
-      // Read-only preview with Edit, or the editor with Save / Done.
-      .when(Boolean(this.file) && this.canEdit(), el => el.child(h_flex().h(34).flex_none().px(8).gap(4).items_center().border_b(1).border_color(t.border).text_size(12)
+      .when(!this.file, el => el.child(tree))
+      .when(Boolean(this.file) && !split, el => el.child(fileView))
+      // Full screen: the tree stays, the file opens beside it; drag the line (double-click: back to 320).
+      .when(split, el => el.child(h_flex().id("files-split").flex_1().min_h(0).min_w(0)
+        .child(v_flex().id("files-side").w(treeW).flex_none().min_h(0).h_full().child(tree))
+        .child(div().id("files-resize").w(7).flex_none().h_full().flex().justify_center().cursor_col_resize()
+          .on_mouse_down("left", (e, cx) => {
+            cx.stop_propagation();
+            if (e.click_count === 2) { this.treeW = 320; this.drag = null; try { localStorage.setItem("treeWidth", "320"); } catch {} }
+            else this.drag = { x: e.position.x, w: treeW };
+            cx.notify();
+          })
+          .child(div().w(this.drag ? 3 : 1).h_full().bg(this.drag ? t.accent : t.border).hover(s => s.bg(t.accent))))
+        .child(v_flex().id("files-main").flex_1().min_w(0).min_h(0).h_full().child(fileView))));
+  }
+
+  endDrag(cx) {
+    if (!this.drag) return;
+    this.drag = null;
+    try { localStorage.setItem("treeWidth", String(this.treeW)); } catch {}
+    cx.notify();
+  }
+
+  // The open file: read-only preview with Edit, or the editor with Save / Done.
+  fileView(t, dirty) {
+    return v_flex().id("files-file").flex_1().min_h(0).min_w(0)
+      .when(this.canEdit(), el => el.child(h_flex().h(34).flex_none().px(8).gap(4).items_center().border_b(1).border_color(t.border).text_size(12)
         .child(h_flex().flex_1().min_w(0).gap(6).items_center()
           .when(this.editing, el => el.child(div().px(6).h(20).flex().flex_none().items_center().rounded(4).bg(t.accent + "26").text_color(t.accent).child("Editing")))
           .when(dirty, el => el.child(div().flex_none().text_color(t.foreground).child("●")))
@@ -377,10 +424,10 @@ export default class Files extends View {
           .child(this.button("files-save", "save", "Save (ctrl+s)", cx => this.save(cx), t, dirty && !this.saving, tint(t).save))
           .child(this.button("files-done", "check", "Done", cx => this.setEditing(false, cx), t, true, tint(t).done)))))
       // Double-click the preview to start editing, keeping the word it selected.
-      .when(Boolean(this.file), el => el.child(this.code
+      .child(this.code
         ? div().id("files-code").flex_1().min_h(0).flex().flex_col()
           .on_mouse_down("left", (e, cx) => { if (!this.editing && e.click_count === 2 && this.canEdit()) this.setEditing(true, cx); })
           .child(Editor.new(this.code).flex_1().min_h(0))
-        : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")));
+        : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…"));
   }
 }
