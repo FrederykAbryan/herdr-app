@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, agents, terminals, machines, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay } from "herdr";
+import { spaces, panes, focused, agents, terminals, machines, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay, home } from "herdr";
 import { typeIcon, folderIcon } from "./filetypes.js";
 
 function location() {
@@ -141,6 +141,20 @@ const SESSIONS = "changes.sessions";
 const ENDED_KEEP = 3 * 24 * 3600 * 1000;
 // A session as saved: session() adds its address on top.
 const record = ({ address: _a, ...rest }) => rest;
+// Every repo a session covers: the one its agent started in, then the others it worked in
+// (`extra`: {root: {tree, head, paths, at}}), each with its own snapshot.
+function sessionRoots(s) {
+  const out = [];
+  if (s?.root && s.tree) out.push({ root: s.root, tree: s.tree, head: s.head, paths: s.paths, primary: true });
+  for (const [root, x] of Object.entries(s?.extra ?? {})) if (root !== s.root && x?.tree) out.push({ root, ...x, primary: false });
+  return out;
+}
+// A session's snapshot of one of its repos, changed (after a commit, Start over).
+function withRoot(s, root, change) {
+  if (s.root === root) return { ...s, ...change };
+  return { ...s, extra: { ...(s.extra ?? {}), [root]: { ...(s.extra?.[root] ?? {}), ...change } } };
+}
+const tilde = (path) => { const h = home(); return h && path.startsWith(h + "/") ? `~${path.slice(h.length)}` : path; };
 // Which agent session runs in each Herdr terminal, for any agent CLI. A terminal's agent is
 // the first program under its shell(s) (processes carry HC_TERMINAL_ID). Its session id:
 // - Claude Code: ~/.claude/sessions/<pid>.json (checked against the start time: pids get reused);
@@ -169,35 +183,145 @@ def shell(pid): return procs[pid]["name"] in SHELLS
 def tree(pid):
     yield pid
     for k in kids.get(pid, []): yield from tree(k)
-# The agent: a non-shell process whose ancestors in its terminal are all shells; the newest wins.
-agents = {}
+def orphan(ppid):
+    # Reparented to init or a systemd subreaper: its starter (an agent's helper launcher, e.g. an
+    # MCP server's) exited. It still carries the terminal's id but isn't the terminal's program.
+    if ppid <= 1: return True
+    try: s = open(f"/proc/{ppid}/stat").read(); return s[s.index("(") + 1:s.rindex(")")] in ("systemd", "init")
+    except Exception: return False
+# The agent: a non-shell process whose ancestors in its terminal are all shells. One with a
+# known session (below) beats one without; then the newest wins.
+cands = {}
 for pid, p in procs.items():
     if shell(pid): continue
     up = p["ppid"]
     while up in procs and procs[up]["term"] == p["term"] and shell(up): up = procs[up]["ppid"]
     if up in procs and procs[up]["term"] == p["term"]: continue
-    cur = agents.get(p["term"])
-    if cur is None or int(p["start"]) > int(procs[cur]["start"]): agents[p["term"]] = pid
+    if up not in procs and orphan(up): continue
+    cands.setdefault(p["term"], []).append(pid)
 claude = {}
+def load(f):
+    # Claude Code rewrites the file all the time (status, updatedAt): a read can catch it half written.
+    for _ in range(3):
+        try: return json.load(open(f))
+        except ValueError: __import__("time").sleep(0.02)
+    return json.load(open(f))
 for f in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
     try:
-        j = json.load(open(f)); pid = int(j["pid"])
+        j = load(f); pid = int(j["pid"])
         if pid in procs and j.get("sessionId") and str(j.get("procStart") or procs[pid]["start"]) == procs[pid]["start"]: claude[pid] = j["sessionId"]
     except Exception: pass
+agents = {t: max(pids, key=lambda q: (any(x in claude for x in tree(q)), int(procs[q]["start"]))) for t, pids in cands.items()}
+# What each agent changed, in any repo: its transcript, read on from where the last run stopped
+# (offsets cached in the temp folder). Claude Code: Edit/Write/MultiEdit/NotebookEdit file paths;
+# Codex and the like: apply_patch's "*** Update File:" lines. Repos its commands name (paths
+# under home in a Bash call) or run in (its child processes' folders) count as touched.
+HOME = os.path.expanduser("~")
+CACHE = "/tmp/herdr-changes-transcripts-%d.json" % os.getuid()
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+PATCH = re.compile(r"\*\*\* (?:Add File|Update File|Delete File|Move to): ([^\\\n\"]+)")
+HOMEPATH = re.compile(r"(?<![\w.~/-])(" + re.escape(HOME) + r"/[^\s'\"\x60;|&<>()$\\]+|~/[^\s'\"\x60;|&<>()$\\]+)")
+try: cache = json.load(open(CACHE))
+except Exception: cache = {}
+seen, roots = set(), {}
+def root_of(path):
+    d = path if os.path.isdir(path) else os.path.dirname(path)
+    walked = []
+    while d and d != "/" and d != HOME:
+        if d in roots: r = roots[d]; break
+        walked.append(d)
+        if os.path.exists(d + "/.git"): r = d; break
+        d = os.path.dirname(d)
+    else: r = None
+    for w in walked: roots[w] = r
+    return r
+def when(j):
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(str(j.get("timestamp")).replace("Z", "+00:00")).timestamp() * 1000)
+    except Exception: return 0
+def scan(path, cwd):
+    seen.add(path)
+    try: size = os.path.getsize(path)
+    except Exception: return None
+    c = cache.get(path)
+    if not c or c["off"] > size: c = {"off": 0, "edits": {}, "touch": {}, "cwd": cwd}
+    if size > c["off"]:
+        with open(path, "rb") as f: f.seek(c["off"]); data = f.read(64 << 20)
+        end = data.rfind(b"\n") + 1
+        for raw in data[:end].split(b"\n"):
+            if not raw or not (b'"tool_use"' in raw or b"File: " in raw or b"_call" in raw or b"session_meta" in raw or b"turn_context" in raw): continue
+            line = raw.decode("utf-8", "replace")
+            try: j = json.loads(line)
+            except Exception: continue
+            ts = when(j)
+            p = j.get("payload") if isinstance(j.get("payload"), dict) else {}
+            if j.get("type") in ("session_meta", "turn_context") and p.get("cwd"): c["cwd"] = p["cwd"]
+            here = j.get("cwd") or c["cwd"]
+            content = (j.get("message") or {}).get("content") if isinstance(j.get("message"), dict) else None
+            for b in content if isinstance(content, list) else []:
+                if not isinstance(b, dict) or b.get("type") != "tool_use": continue
+                inp = b.get("input") or {}
+                if b.get("name") in EDIT_TOOLS:
+                    f = inp.get("file_path") or inp.get("notebook_path")
+                    if f: f = os.path.join(here, f); c["edits"][f] = max(ts, c["edits"].get(f, 0))
+                elif b.get("name") == "Bash":
+                    for m in HOMEPATH.findall(str(inp.get("command", ""))): c["touch"][os.path.expanduser(m)] = ts
+            if not content:
+                for m in PATCH.findall(line):
+                    f = os.path.join(here, m.strip()); c["edits"][f] = max(ts, c["edits"].get(f, 0))
+                if "_call" in line:
+                    for m in HOMEPATH.findall(line): c["touch"][os.path.expanduser(m)] = ts
+        c["off"] += end
+    cache[path] = c
+    return c
+now = int(__import__("time").time() * 1000)
+def work(pid, sid, files):
+    try: cwd = os.readlink(f"/proc/{pid}/cwd")
+    except Exception: cwd = HOME
+    edits, touch = {}, {}
+    for path in files:
+        c = scan(path, cwd)
+        if not c: continue
+        for f, ts in c["edits"].items():
+            r = root_of(f)
+            if r: edits.setdefault(r, {})[os.path.relpath(f, r)] = max(ts, edits.get(r, {}).get(os.path.relpath(f, r), 0))
+        for f, ts in c["touch"].items():
+            r = root_of(f)
+            if r: touch[r] = max(ts, touch.get(r, 0))
+    for q in tree(pid):
+        if q == pid: continue
+        try:
+            r = root_of(os.readlink(f"/proc/{q}/cwd"))
+            if r: touch[r] = now
+        except Exception: pass
+    return edits, touch
 out = {}
 for t, pid in agents.items():
-    sid = None
+    sid, files = None, []
     for q in tree(pid):
-        if q in claude: sid = "claude:" + claude[q]; break
+        if q in claude:
+            sid = "claude:" + claude[q]
+            files = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{claude[q]}.jsonl")) + glob.glob(os.path.expanduser(f"~/.claude/projects/*/{claude[q]}/**/*.jsonl"), recursive=True)
+            break
     if not sid:
         for q in tree(pid):
             try:
                 for fd in os.listdir(f"/proc/{q}/fd"):
-                    m = SESSION.search(os.readlink(f"/proc/{q}/fd/{fd}"))
-                    if m: sid = procs[pid]["name"] + ":" + m.group(1); break
+                    link = os.readlink(f"/proc/{q}/fd/{fd}")
+                    m = SESSION.search(link)
+                    if m:
+                        sid = procs[pid]["name"] + ":" + m.group(1)
+                        if link.endswith(".jsonl"): files = [link]
+                        break
             except Exception: pass
             if sid: break
-    out[t] = {"id": sid or "proc:%s:%d:%s" % (procs[pid]["name"], pid, procs[pid]["start"]), "pid": pid}
+    edits, touch = work(pid, sid, files)
+    out[t] = {"id": sid or "proc:%s:%d:%s" % (procs[pid]["name"], pid, procs[pid]["start"]), "pid": pid, "edits": edits, "touch": touch}
+try:
+    tmp = CACHE + ".%d" % os.getpid()
+    json.dump({k: v for k, v in cache.items() if k in seen}, open(tmp, "w")); os.replace(tmp, CACHE)
+except Exception: pass
 print(json.dumps(out))
 `;
 const hash = (s) => { let h = 5381; for (const c of s) h = (h * 33 + c.codePointAt(0)) >>> 0; return h.toString(36); };
@@ -283,7 +407,8 @@ const GROUP_TITLE = { staged: "Staged Changes", outside: "Staged outside this se
 export default class Changes extends View {
   init(_props, cx) {
     this.groups = []; this.rows = []; this.diffWidth = 0; this.message = ""; this.handle = cx.focus_handle();
-    this.pending = new Set(); this.queue = {}; this.collapsed = new Set(); this.collapsedGroups = new Set(["committed"]);
+    this.pending = new Set(); this.queue = {}; this.collapsed = new Set(); this.folded = new Set(); this.foldedRepos = new Set();
+    this.repos = []; this.active = null; this.watched = new Set(); this.watchGen = 0;
     try { this.mode = localStorage.getItem("mode") === "all" ? "all" : "session"; } catch { this.mode = "session"; }
     try { this.tree = localStorage.getItem("view") !== "list"; } catch { this.tree = true; }
     // The diff under the list can be put away: files then open in the side-by-side compare.
@@ -319,10 +444,12 @@ export default class Changes extends View {
     cx.timer.every(3000, (cx) => this.attribute(cx));
   }
 
-  group(id) { return this.groups.find((g) => g.id === id)?.items ?? []; }
+  // A group of the repo Commit acts on, by kind ("staged", "outside", "changes", "committed").
+  group(kind, repo = this.repo()) { return repo?.groups.find((g) => g.kind === kind)?.items ?? []; }
+  // A row's key: `<group id>|<path>`; the group id is `<repo root>#<kind>`.
   item(key) {
-    const at = key.indexOf("|"), group = key.slice(0, at), path = key.slice(at + 1);
-    return { group, path, item: this.group(group).find((f) => f.path === path) };
+    const g = this.groups.find((x) => key.startsWith(`${x.id}|`)), path = g ? key.slice(g.id.length + 1) : key.slice(key.indexOf("|") + 1);
+    return { group: g?.kind ?? null, path, repo: g?.repo ?? null, item: g?.items.find((f) => f.path === path) };
   }
 
   // The agent whose changes Session mode shows: the focused terminal's. A plain terminal has
@@ -432,6 +559,9 @@ export default class Changes extends View {
       if (this.pending.has(a.address)) continue;
       const s = saved[a.address], { id, pid } = ids[a.address] ?? {};
       if (id) {
+        // Only its process this time, though the same process had a real session id: its
+        // session file was being rewritten as it was read. Still the same session.
+        if (id.startsWith("proc:") && s?.live && s.agentSession && !s.agentSession.startsWith("proc:") && s.agentPid === pid) continue;
         if (s?.agentSession === id) { if (!s.live) ops.push(["revive", a.address]); else if (!Array.isArray(s.paths)) ops.push(["fresh", a, id, null, pid]); continue; }
         // Recorded before its id was known (no id yet, or only its process while the agent
         // hadn't written its session file): it's this session.
@@ -480,7 +610,8 @@ export default class Changes extends View {
       setShared(SESSIONS, next);
       this.tracking = false;
       for (const [a, id, pid] of fresh) { this.pending.delete(a.address); this.baseline(a, cx, id, pid); }
-      cx.notify();
+      // With nothing awaited this ran inside render, where notify throws; setShared redraws anyway.
+      try { cx.notify(); } catch {}
     });
   }
 
@@ -489,51 +620,104 @@ export default class Changes extends View {
   // working or blocked (now or at the last look). With none working they go to the repo's only
   // agent if it has just one, else to nobody: another agent's work, or your own edits, don't
   // show up in a session that didn't make them.
+  //
+  // A session isn't tied to one repo: an agent started in the frontend that edits the backend
+  // too (or one started in a plain folder) gets a snapshot of each other repo the first time
+  // its transcript shows an edit there (`extra`, per repo). Files its transcript says it edited
+  // are its own wherever they are. In those other repos, files that change while it works go
+  // to it only if it ran a command there at that time, so your own edits there stay out.
   attribute(cx) {
     // Also from here, not only render: a hidden panel keeps its timers but isn't drawn.
     this.trackSessions(cx);
     if (this.attributing) return;
-    const saved = shared(SESSIONS) ?? {}, repos = new Map();
+    const saved = shared(SESSIONS) ?? {}, repos = new Map(), ids = this.ids ?? {}, credit = {}, discover = [];
+    const give = (address, root, paths) => {
+      const k = `${address}\n${root}`;
+      credit[k] ??= new Set();
+      for (const p of paths) credit[k].add(p);
+    };
     for (const a of agents()) {
       const s = saved[a.address];
-      if (!s?.live || !s.root || !s.tree || !Array.isArray(s.paths)) continue;
-      const k = `${s.on ?? ""}:${s.root}`;
-      if (!repos.has(k)) repos.set(k, { root: s.root, on: s.on, agents: [] });
-      repos.get(k).agents.push({ address: a.address, busy: a.status === "working" || a.status === "blocked" });
+      if (!s?.live || !Array.isArray(s.paths)) continue;
+      const busy = a.status === "working" || a.status === "blocked", mine = sessionRoots(s);
+      for (const r of mine) {
+        const k = `${s.on ?? ""}:${r.root}`;
+        if (!repos.has(k)) repos.set(k, { root: r.root, on: s.on, agents: [] });
+        repos.get(k).agents.push({ address: a.address, busy, primary: r.primary, touch: ids[a.address]?.touch?.[r.root] ?? 0 });
+      }
+      const { edits = {}, touch = {} } = ids[a.address] ?? {}, since = s.at ?? 0;
+      for (const root of new Set([...Object.keys(edits), ...Object.keys(touch)])) {
+        const paths = Object.entries(edits[root] ?? {}).filter(([, ts]) => ts >= since).map(([p]) => p);
+        if (mine.some((r) => r.root === root)) { if (paths.length) give(a.address, root, paths); continue; }
+        const k = `${a.address}\n${root}`;
+        // A repo it only named in a command is tracked from then on, once it edits a file there
+        // or works there (a command running in it).
+        if ((paths.length || (touch[root] ?? 0) >= since && busy) && !this.discovering?.has(k)) discover.push({ address: a.address, root, on: s.on, paths });
+      }
     }
     this.last ??= {};
     for (const k of Object.keys(this.last)) if (!repos.has(k)) delete this.last[k];
-    if (!repos.size) return;
+    if (!repos.size && !discover.length && !Object.keys(credit).length) return;
     this.attributing = true;
+    this.discovering ??= new Set();
+    for (const d of discover) this.discovering.add(`${d.address}\n${d.root}`);
     cx.spawn(async (cx) => {
-      const credit = {};
+      const added = {};
       try {
+        // A new repo for a session: snapshot it now, with the files already edited there set
+        // back to HEAD so their edits show (the snapshot comes a moment after the edit).
+        for (const d of discover) {
+          try {
+            let tree = await this.snapshot(d.root, d.on);
+            if (d.paths.length) tree = await this.advance(d.root, d.on, tree, d.paths).catch(() => tree);
+            const head = await exec("git", ["rev-parse", "-q", "--verify", "HEAD"], { cwd: d.root, on: d.on });
+            added[`${d.address}\n${d.root}`] = { tree, head: head.code === 0 ? head.stdout.trim() : null, paths: d.paths, at: Date.now() };
+          } catch {}
+        }
         for (const [k, repo] of repos) {
           const prev = this.last[k];
           const now = await this.snapshot(repo.root, repo.on).catch(() => null);
           if (!now) continue;
           const busy = new Set(repo.agents.filter((a) => a.busy).map((a) => a.address));
-          this.last[k] = { tree: now, busy };
+          this.last[k] = { tree: now, busy, at: Date.now() };
           if (!prev || prev.tree === now) continue;
           const r = await exec("git", [...READ, "diff", "--name-only", "-z", "--no-renames", prev.tree, now], { cwd: repo.root, on: repo.on });
           const paths = r.code === 0 ? r.stdout.split("\0").filter(Boolean) : [];
           if (!paths.length) continue;
-          let to = repo.agents.filter((a) => busy.has(a.address) || prev.busy.has(a.address)).map((a) => a.address);
-          if (!to.length && repo.agents.length === 1) to = [repo.agents[0].address];
-          for (const a of to) { credit[a] ??= new Set(); for (const p of paths) credit[a].add(p); }
+          // Its own repo: anything while it works. Another repo: only while it ran a command there.
+          const working = (a) => (busy.has(a.address) || prev.busy.has(a.address)) && (a.primary || a.touch >= prev.at - 3000);
+          let to = repo.agents.filter(working).map((a) => a.address);
+          const own = repo.agents.filter((a) => a.primary);
+          if (!to.length && repo.agents.length === 1 && own.length === 1) to = [own[0].address];
+          for (const a of to) give(a, repo.root, paths);
         }
-        if (Object.keys(credit).length) {
+        if (Object.keys(credit).length || Object.keys(added).length) {
           const next = { ...(shared(SESSIONS) ?? {}) };
-          for (const [a, paths] of Object.entries(credit)) {
-            if (!next[a]?.live || !Array.isArray(next[a].paths)) continue;
-            const had = new Set(next[a].paths), size = had.size;
-            for (const p of paths) had.add(p);
-            if (had.size !== size) next[a] = { ...next[a], paths: [...had] };
+          let changed = false;
+          for (const [k, x] of Object.entries(added)) {
+            const [a, root] = k.split("\n"), s = next[a];
+            if (!s?.live || sessionRoots(s).some((r) => r.root === root)) continue;
+            next[a] = { ...s, extra: { ...(s.extra ?? {}), [root]: x } };
+            changed = true;
           }
-          setShared(SESSIONS, next);
+          for (const [k, paths] of Object.entries(credit)) {
+            const [a, root] = k.split("\n"), s = next[a];
+            if (!s?.live || !Array.isArray(s.paths)) continue;
+            const primary = s.root === root && s.tree, x = primary ? s : s.extra?.[root];
+            if (!x) continue;
+            const had = new Set(x.paths ?? []), size = had.size;
+            for (const p of paths) had.add(p);
+            if (had.size === size) continue;
+            next[a] = primary ? { ...s, paths: [...had] } : { ...s, extra: { ...s.extra, [root]: { ...x, paths: [...had] } } };
+            changed = true;
+          }
+          if (changed) setShared(SESSIONS, next); else { for (const k of Object.keys(credit)) delete credit[k]; }
         }
-      } finally { this.attributing = false; }
-      if (Object.keys(credit).length) { this.refresh(cx); cx.notify(); }
+      } finally {
+        this.attributing = false;
+        for (const d of discover) this.discovering.delete(`${d.address}\n${d.root}`);
+      }
+      if (Object.keys(credit).length || Object.keys(added).length) { this.refresh(cx); cx.notify(); }
     });
   }
 
@@ -559,58 +743,115 @@ export default class Changes extends View {
   // Starts the focused session over from the working tree as it is now.
   restart(cx) {
     const s = this.session();
-    if (!s?.root || this.busy) return;
+    if (!s || !sessionRoots(s).length || this.busy) return;
     this.busy = true;
     cx.spawn(async (cx) => {
       try {
-        const tree = await this.snapshot(s.root, s.on);
-        const head = await exec("git", ["rev-parse", "-q", "--verify", "HEAD"], { cwd: s.root, on: s.on });
-        this.saveSession(s.address, { ...record(s), tree, head: head.code === 0 ? head.stdout.trim() : null, paths: [], at: Date.now(), error: undefined });
+        // Its other repos are dropped: edits from now on bring them back.
+        let value = { ...record(s), paths: [], extra: {}, at: Date.now(), error: undefined };
+        if (s.root && s.tree) {
+          const tree = await this.snapshot(s.root, s.on);
+          const head = await exec("git", ["rev-parse", "-q", "--verify", "HEAD"], { cwd: s.root, on: s.on });
+          value = { ...value, tree, head: head.code === 0 ? head.stdout.trim() : null };
+        }
+        this.saveSession(s.address, value);
       }
       catch (e) { this.note = `Could not snapshot: ${e}`; }
       finally { this.busy = false; this.refresh(cx); cx.notify(); }
     });
   }
 
-  watch(root, cx) {
-    if (this.on || this.watched === root) return;
-    this.watched = root;
-    cx.spawn(async (cx) => {
-      try {
-        while (this.watched === root) {
-          await watchFolder(root);
-          if (this.watched === root) this.refresh(cx);
-        }
-      } catch { this.watched = null; }
-    });
+  // Every repo shown is watched (here only; remote ones refresh on the timer).
+  watch(roots, on, cx) {
+    if (on) return;
+    const gen = this.watchGen;
+    for (const root of roots) {
+      if (this.watched.has(root)) continue;
+      this.watched.add(root);
+      cx.spawn(async (cx) => {
+        try {
+          while (this.watchGen === gen) {
+            await watchFolder(root);
+            if (this.watchGen === gen) this.refresh(cx);
+          }
+        } catch { if (this.watchGen === gen) this.watched.delete(root); }
+      });
+    }
   }
+
+  // The repo Commit, Generate, search and the graph act on: the one picked (a click on its
+  // header, a file, or staging in it), else the first.
+  repo() { return this.repos.find((r) => r.root === this.active) ?? this.repos[0] ?? null; }
+  get root() { return this.repo()?.root ?? null; }
+  get hasHead() { return this.repo()?.hasHead ?? false; }
+  setActive(root, cx) { if (this.active !== root) { this.active = root; cx?.notify(); } }
 
   refresh(cx) {
     if (this.loading || this.busy) return;
     const { cwd, on } = location(), context = this.key();
     if (context !== this.context) {
-      this.context = context; this.root = null; this.groups = []; this.open = null; this.trees = null;
-      this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false; this.confirming = null;
+      this.context = context; this.repos = []; this.groups = []; this.open = null; this.watched = new Set(); this.watchGen = (this.watchGen ?? 0) + 1;
+      this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.closed = false; this.limited = false; this.confirming = null;
     }
-    if (!cwd) return;
+    const session = this.session();
+    if (!cwd && !session) return;
     this.loading = true;
     cx.spawn(async (cx) => {
       try {
-        const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
+        const top = cwd ? await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }) : null;
         if (this.key() !== context) return;
-        if (top.code !== 0) { this.root = null; this.groups = []; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
-        const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
+        const here = top?.code === 0 ? top.stdout.trim() : null, mine = session ? sessionRoots(session) : [];
+        let list = [], error = null;
+        if (this.mode === "session") {
+          if (!session) error = "No agent session in this tab";
+          else if (session.error) error = `Session snapshot failed: ${session.error}`;
+          else if (!mine.length) error = "This session hasn't changed a git repository yet";
+          else list = mine;
+        } else {
+          // All: every change in this folder's repo, and in the other repos this tab's agent works in.
+          list = [...new Set([here, ...mine.map((r) => r.root)].filter(Boolean))].map((root) => ({ root }));
+          if (!list.length) error = "Not a git repository";
+        }
+        // The repo of the focused folder first, then the rest by name.
+        list.sort((a, b) => (b.root === here) - (a.root === here) || (b.primary ? 1 : 0) - (a.primary ? 1 : 0) || a.root.split("/").pop().localeCompare(b.root.split("/").pop()));
+        const repos = [];
+        for (const r of list) {
+          try { repos.push(await this.scan(r.root, session?.on ?? on, this.mode === "session" ? r : null, session)); }
+          catch (e) {
+            // A repo folder that's gone (a removed worktree, a deleted scratch repo) just drops out.
+            if ((await exec("test", ["-d", r.root], { on: session?.on ?? on }).catch(() => ({ code: 0 }))).code !== 0) continue;
+            repos.push({ root: r.root, on: session?.on ?? on, name: r.root.split("/").pop(), groups: [], error: String(e?.message ?? e) }); }
+          if (this.key() !== context) return;
+        }
+        this.repos = repos; this.groups = repos.flatMap((r) => r.groups); this.error = error;
+        this.limited = repos.some((r) => r.limited);
+        if (this.active && !repos.some((r) => r.root === this.active)) this.active = null;
+        // With nothing picked, Commit goes where something is staged.
+        if (!this.active) this.active = (repos.find((r) => r.groups.some((g) => (g.kind === "staged" || g.kind === "outside") && g.items.length)) ?? repos[0])?.root ?? null;
+        this.watch(repos.map((r) => r.root), session?.on ?? on, cx);
+        if (this.open && !this.item(this.open).item) { this.open = null; this.setLines([]); }
+        // The first file's diff shows until you pick another.
+        const first = this.groups.find((g) => g.items.length);
+        if (!this.open && !this.closed && first && this.preview) this.open = `${first.id}|${first.items[0].path}`;
+        if (!first) this.setLines([]);
+        if (this.open) {
+          try { await this.load(this.open, context); }
+          catch { if (this.key() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
+        }
+      } catch (e) { if (this.key() === context) this.error = String(e); }
+      finally { this.loading = false; cx.notify(); }
+    });
+  }
+
+  // One repo's groups. s: the session's snapshot of it (Session mode), else everything.
+  async scan(root, on, s, session) {
+        const git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
         const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
         if (status.code !== 0) throw new Error(status.stderr);
         const hasHead = (await git(["rev-parse", "-q", "--verify", "HEAD"])).code === 0;
-        let { staged, changes } = parseStatus(status.stdout), outside = [], committed = [], trees = null, error = null;
-        if (this.mode === "session") {
-          const s = this.session();
-          if (!s) error = "No agent session in this tab";
-          else if (s.error) error = `Session snapshot failed: ${s.error}`;
-          else if (s.root !== root) error = s.root ? `This tab's agent works in ${s.root}` : "This tab's agent didn't start in a git repository";
-          if (error) { staged = []; changes = []; }
-          else {
+        let { staged, changes } = parseStatus(status.stdout), outside = [], committed = [], trees = null;
+        if (s) {
+          {
             const now = await this.snapshot(root, on);
             const names = await git(["diff", "--name-status", "-z", "--no-renames", s.tree, now]);
             const nums = await git(["diff", "--numstat", "-z", "--no-renames", s.tree, now]);
@@ -655,29 +896,22 @@ export default class Changes extends View {
         }
         const cap = (items) => items.slice(0, 1000);
         const limited = [staged, outside, changes, committed].some((items) => items.length > 1000);
-        const groups = [["staged", staged], ["outside", outside], ["changes", changes], ["committed", committed]]
-          .filter(([id, items]) => items.length || id === "changes").map(([id, items]) => ({ id, items: cap(items) }));
-        if (this.key() !== context) return;
-        this.root = root; this.on = on; this.hasHead = hasHead; this.groups = groups; this.limited = limited; this.trees = trees; this.error = error;
-        this.watch(root, cx);
-        if (this.open && !this.item(this.open).item) { this.open = null; this.setLines([]); }
-        // The first file's diff shows until you pick another.
-        const first = groups.find((g) => g.items.length);
-        if (!this.open && !this.closed && first && this.preview) this.open = `${first.id}|${first.items[0].path}`;
-        if (!first) this.setLines([]);
-        if (this.open) {
-          try { await this.load(this.open, context); }
-          catch { if (this.key() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
+        const repo = { root, on, hasHead, trees, limited, session: s ? session : null, primary: Boolean(s?.primary), name: root.split("/").pop() };
+        // A group's id carries its repo: the same file can be listed in two repos' groups.
+        repo.groups = [["staged", staged], ["outside", outside], ["changes", changes], ["committed", committed]]
+          .filter(([kind, items]) => items.length || kind === "changes").map(([kind, items]) => ({ id: `${root}#${kind}`, kind, repo, items: cap(items) }));
+        if (hasHead) {
+          const b = await git(["branch", "--show-current"]);
+          repo.branch = b.code === 0 ? b.stdout.trim() : "";
         }
-      } catch (e) { if (this.key() === context) this.error = String(e); }
-      finally { this.loading = false; cx.notify(); }
-    });
+        return repo;
   }
 
   // Session: the session's own diff. Staged: index vs HEAD. Changes: work tree vs index.
   async load(key, context) {
-    const { group, path, item } = this.item(key), root = this.root, on = this.on;
+    const { group, path, item, repo } = this.item(key);
     if (!item) return;
+    const root = repo.root, on = repo.on;
     const lang = langOf(path);
     const diff = async (args) => {
       const r = await exec("git", [...READ, "--literal-pathspecs", "diff", "--no-ext-diff", "--no-textconv", "--no-color", ...args, "--", path], { cwd: root, on });
@@ -687,7 +921,7 @@ export default class Changes extends View {
     };
     let lines;
     // Staged files show what the commit would hold (HEAD → index), in Session mode too.
-    if (this.trees && group !== "outside" && group !== "staged") lines = await diff([this.trees.base, this.trees.now]);
+    if (repo.trees && group !== "outside" && group !== "staged") lines = await diff([repo.trees.base, repo.trees.now]);
     else if (group === "staged" || group === "outside") lines = await diff(["--cached"]);
     else if (item.fresh) {
       const text = await readTextFile(`${root}/${path}`, { on }).catch(() => null);
@@ -727,6 +961,8 @@ export default class Changes extends View {
   }
 
   pick(key, cx) {
+    const { repo } = this.item(key);
+    if (repo) this.setActive(repo.root);
     if (!this.preview) { this.compare(key, cx); return; }
     this.open = this.open === key ? null : key; this.setLines([]); this.note = null;
     this.closed = !this.open;
@@ -741,37 +977,40 @@ export default class Changes extends View {
 
   // What a file is compared against in the side-by-side view (mods/diff-view): the same two
   // states this panel's own diff shows.
-  sides(group, f) {
-    if (this.trees && group !== "outside" && group !== "staged") {
-      const s = this.session(), at = s?.at ? new Date(s.at) : null;
+  sides(group, f, repo) {
+    if (repo.trees && group !== "outside" && group !== "staged") {
+      const s = repo.session, x = s && s.root !== repo.root ? s.extra?.[repo.root] : s, at = x?.at ? new Date(x.at) : null;
       const since = at ? ` ${at.getHours()}:${String(at.getMinutes()).padStart(2, "0")}` : "";
-      return { left: this.trees.base, right: "worktree", leftLabel: `Session start${since}`, rightLabel: "Working tree" };
+      return { left: repo.trees.base, right: "worktree", leftLabel: `Session start${since}`, rightLabel: "Working tree" };
     }
-    if (group === "staged" || group === "outside") return { left: this.hasHead ? "HEAD" : "none", right: "index", leftLabel: "HEAD", rightLabel: "Staged" };
+    if (group === "staged" || group === "outside") return { left: repo.hasHead ? "HEAD" : "none", right: "index", leftLabel: "HEAD", rightLabel: "Staged" };
     return { left: f.fresh ? "none" : "index", right: "worktree", leftLabel: f.fresh ? "New file" : "Index", rightLabel: "Working tree" };
   }
 
-  // Opens the file big, old and new side by side, with every listed file a step away.
+  // Opens the file big, old and new side by side, with every listed file of its repo a step away.
   // edit: opens it straight in the compare's editor.
   compare(key, cx, edit = false) {
-    if (!this.root) return;
+    const { repo } = this.item(key);
+    if (!repo) return;
     const files = [];
-    for (const g of this.groups) for (const f of g.items) files.push({ key: `${g.id}|${f.path}`, path: f.path, status: f.status, ...this.sides(g.id, f) });
+    for (const g of repo.groups) for (const f of g.items) files.push({ key: `${g.id}|${f.path}`, path: f.path, status: f.status, ...this.sides(g.kind, f, repo) });
     const index = files.findIndex((f) => f.key === key);
     if (index < 0) return;
-    openOverlay({ mod: "diff-view", kind: "dialog", width: 0.94, height: 0.92, props: { root: this.root, on: this.on, files, index, edit } });
+    openOverlay({ mod: "diff-view", kind: "dialog", width: 0.94, height: 0.92, props: { root: repo.root, on: repo.on, files, index, edit } });
   }
 
   // The compare can edit a file's working-tree copy on this computer (writeTextFile is local only).
   canEdit(key) {
-    const { group, item } = this.item(key);
-    return Boolean(item && this.root && !this.on && this.sides(group, item).right === "worktree");
+    const { group, item, repo } = this.item(key);
+    return Boolean(item && repo && !repo.on && this.sides(group, item, repo).right === "worktree");
   }
 
   // Stage and unstage change the repo's index, as `git add` / `git restore --staged` would.
-  gitAction(args, cx) {
-    if (!this.root || this.busy) return;
-    const root = this.root, on = this.on;
+  // Acting in a repo makes it the one Commit goes to.
+  gitAction(repo, args, cx) {
+    if (!repo || this.busy) return;
+    const root = repo.root, on = repo.on;
+    this.setActive(root);
     this.busy = true; this.note = null;
     cx.spawn(async (cx) => {
       try {
@@ -782,24 +1021,24 @@ export default class Changes extends View {
     });
     cx.notify();
   }
-  stage(paths, cx) { if (paths.length) this.gitAction(["add", "-A", "--", ...paths], cx); }
-  unstage(paths, cx) {
-    if (paths.length) this.gitAction(this.hasHead ? ["restore", "--staged", "--", ...paths] : ["rm", "--cached", "-r", "-q", "--", ...paths], cx);
+  stage(repo, paths, cx) { if (paths.length) this.gitAction(repo, ["add", "-A", "--", ...paths], cx); }
+  unstage(repo, paths, cx) {
+    if (paths.length) this.gitAction(repo, repo.hasHead ? ["restore", "--staged", "--", ...paths] : ["rm", "--cached", "-r", "-q", "--", ...paths], cx);
   }
 
   // Discard, as VS Code's ↺ on Changes: the working copy goes back to the index (to HEAD if
   // nothing is staged), and new untracked files are deleted. Asks first: it can't be undone.
-  discard(paths, label, cx) {
-    const items = this.group("changes").filter((f) => paths.includes(f.path));
-    if (!items.length || !this.root || this.busy) return;
-    this.confirming = { items, label }; this.note = null;
+  discard(repo, paths, label, cx) {
+    const items = this.group("changes", repo).filter((f) => paths.includes(f.path));
+    if (!items.length || !repo || this.busy) return;
+    this.confirming = { items, label: this.repos.length > 1 ? `${label} (${repo.name})` : label, repo }; this.note = null;
     cx.notify();
   }
   discardNow(cx) {
     const ask = this.confirming;
     this.confirming = null;
-    if (!ask || !this.root || this.busy) { cx.notify(); return; }
-    const root = this.root, on = this.on;
+    if (!ask || !ask.repo || this.busy) { cx.notify(); return; }
+    const root = ask.repo.root, on = ask.repo.on;
     const conflicts = ask.items.filter((f) => f.status === "C").map((f) => f.path);
     const fresh = ask.items.filter((f) => f.fresh).map((f) => f.path);
     const tracked = ask.items.filter((f) => !f.fresh && f.status !== "C").map((f) => f.path);
@@ -822,23 +1061,28 @@ export default class Changes extends View {
   // Commits what's staged, like `git commit`. In Session mode the session's committed files
   // then leave its list.
   commit(cx) {
-    if (!this.message.trim() || !this.root || this.busy || this.loading || this.generating || this.context !== this.key()) return;
-    const staged = this.group("staged"), outside = this.group("outside");
+    const repo = this.repo();
+    if (!this.message.trim() || !repo || this.busy || this.loading || this.generating || this.context !== this.key()) return;
+    const staged = this.group("staged", repo), outside = this.group("outside", repo);
     if (!staged.length && !outside.length) { this.note = "Nothing is staged: stage files with + first"; cx.notify(); return; }
     const reverted = [...staged, ...outside].filter((f) => f.reverted).map((f) => f.path);
     if (reverted.length) {
       this.note = `Reverted but still staged: ${reverted.slice(0, 3).join(", ")}${reverted.length > 3 ? ` +${reverted.length - 3}` : ""}. Unstage (−) to drop the change, or stage (+) again to commit it.`;
       cx.notify(); return;
     }
-    const root = this.root, on = this.on, context = this.context, message = this.message.trim();
-    const session = this.trees ? this.session() : null, paths = staged.map((f) => f.path);
+    const root = repo.root, on = repo.on, context = this.context, message = this.message.trim();
+    const session = repo.trees ? repo.session : null, paths = staged.map((f) => f.path);
     this.busy = true; this.note = null;
     cx.spawn(async (cx) => {
       try {
         const r = await exec("git", ["commit", "-m", message], { cwd: root, on });
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
         this.message = ""; this.input.set_value("");
-        if (session && paths.length) this.saveSession(session.address, { ...record(session), tree: await this.advance(root, on, session.tree, paths) });
+        if (session && paths.length) {
+          const tree = await this.advance(root, on, repo.trees.base, paths);
+          const now = (shared(SESSIONS) ?? {})[session.address] ?? record(session);
+          this.saveSession(session.address, withRoot(now, root, { tree }));
+        }
       } catch (e) { if (this.key() === context) this.note = `Commit failed: ${e?.message ?? e}`; }
       finally { this.busy = false; this.refresh(cx); cx.notify(); }
     });
@@ -846,11 +1090,12 @@ export default class Changes extends View {
   }
 
   generate(cx) {
-    if (!this.root || this.generating || this.busy || this.loading) return;
+    const repo = this.repo();
+    if (!repo || this.generating || this.busy || this.loading) return;
     const staged = this.group("staged").length + this.group("outside").length;
     if (!staged && !this.group("changes").length) return;
-    const context = this.context, root = this.root, on = this.on;
-    const args = staged ? ["cached", "", ""] : this.trees ? ["range", this.trees.base, this.trees.now] : ["all", "", ""];
+    const context = this.context, root = repo.root, on = repo.on;
+    const args = staged ? ["cached", "", ""] : repo.trees ? ["range", repo.trees.base, repo.trees.now] : ["all", "", ""];
     // genSeq: Cancel (or a newer run) makes this one's answer stale; exec can't be killed,
     // so the program finishes in the background and its answer is dropped.
     const seq = ++this.genSeq;
@@ -920,28 +1165,55 @@ export default class Changes extends View {
   }
 
   // The buttons a row offers: discard (↺) and stage (+) what isn't staged, unstage (−) what is.
-  rowAction(group, id, paths, t, label) {
-    if (group === "changes") return h_flex().flex_none().gap(2).items_center()
-      .child(this.iconButton(`discard-${id}`, "discard", (cx) => this.discard(paths, label, cx), t).tooltip("Discard changes"))
-      .child(this.iconButton(`stage-${id}`, "add", (cx) => this.stage(paths, cx), t).tooltip("Stage changes"));
-    if (group === "staged" || group === "outside") return this.iconButton(`unstage-${id}`, "remove", (cx) => this.unstage(paths, cx), t);
+  rowAction(g, id, paths, t, label) {
+    if (g.kind === "changes") return h_flex().flex_none().gap(2).items_center()
+      .child(this.iconButton(`discard-${id}`, "discard", (cx) => this.discard(g.repo, paths, label, cx), t).tooltip("Discard changes"))
+      .child(this.iconButton(`stage-${id}`, "add", (cx) => this.stage(g.repo, paths, cx), t).tooltip("Stage changes"));
+    if (g.kind === "staged" || g.kind === "outside") return this.iconButton(`unstage-${id}`, "remove", (cx) => this.unstage(g.repo, paths, cx), t);
     return null;
   }
 
-  groupRow(g, t) {
-    const id = `group-${g.id}`, open = !this.collapsedGroups.has(g.id), action = this.hovered === id ? this.rowAction(g.id, id, g.items.map((f) => f.path), t, `all ${g.items.length} file${g.items.length === 1 ? "" : "s"}`) : null;
-    return this.hoverable(h_flex().id(id).h(24).flex_none().px(4).gap(4).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => this.toggle(this.collapsedGroups, g.id, cx))
+  // Committed starts folded; a click flips a group from its default.
+  groupFolded(g) { return this.folded.has(g.id) !== (g.kind === "committed"); }
+
+  // With several repos, each gets a header: which repo (and where), its branch, how many
+  // files. A click makes it the one Commit goes to; the chevron folds it.
+  repoRow(repo, t) {
+    const id = `repo-${repo.root}`, folded = this.foldedRepos.has(repo.root), active = repo.root === this.repo()?.root;
+    const count = repo.groups.reduce((n, g) => n + (g.kind === "committed" ? 0 : g.items.length), 0);
+    const staged = repo.groups.reduce((n, g) => n + (g.kind === "staged" || g.kind === "outside" ? g.items.length : 0), 0);
+    return h_flex().id(id).h(40).flex_none().mt(4).pl(2).pr(6).gap(6).items_center().rounded(6).cursor_pointer()
+      .border_l(3).border_color(active ? t.accent : "#00000000").bg(active ? t.accent + "14" : t.background).hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => { this.setActive(repo.root); if (folded) this.foldedRepos.delete(repo.root); cx.notify(); })
+      .child(div().id(`${id}-fold`).size(20).flex_none().flex().items_center().justify_center().rounded(4).hover((s) => s.bg(t.raised))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => { cx.stop_propagation(); this.toggle(this.foldedRepos, repo.root, cx); })
+        .child(icon(folded ? "chevron-right" : "chevron-down", 16).text_color(t.muted)))
+      .child(folderIcon(FT, !folded, repo.name))
+      .child(v_flex().flex_1().min_w(0).gap(1)
+        .child(h_flex().min_w(0).gap(6).items_center()
+          .child(div().min_w(0).truncate().text_size(12.5).font_semibold().text_color(t.foreground).child(repo.name))
+          .when(Boolean(repo.branch), (e) => e.child(div().flex_none().max_w(140).truncate().text_size(10.5).text_color(t.muted).child(`⎇ ${repo.branch}`))))
+        .child(div().min_w(0).truncate().text_size(10.5).text_color(t.dim).child(repo.error ? repo.error : tilde(repo.root))))
+      .when(active, (e) => e.child(div().flex_none().px(6).h(16).flex().items_center().rounded(8).bg(t.accent + "33").text_size(10).text_color(t.accent).child("commit here")))
+      .when(!active && staged > 0, (e) => e.child(div().flex_none().text_size(10.5).text_color(t.blocked).child(`${staged} staged`)))
+      .child(div().flex_none().px(6).h(16).flex().items_center().rounded(8).bg(t.raised).text_color(t.muted).text_size(10).child(String(count)));
+  }
+
+  groupRow(g, t, nested) {
+    const id = `group-${g.id}`, open = !this.groupFolded(g), action = this.hovered === id ? this.rowAction(g, id, g.items.map((f) => f.path), t, `all ${g.items.length} file${g.items.length === 1 ? "" : "s"}`) : null;
+    return this.hoverable(h_flex().id(id).h(24).flex_none().pl(4 + (nested ? 14 : 0)).pr(4).gap(4).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => this.toggle(this.folded, g.id, cx))
       .child(icon(open ? "chevron-down" : "chevron-right", 16).text_color(t.muted))
-      .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(g.id === "outside" ? t.blocked : t.foreground).child(GROUP_TITLE[g.id]))
+      .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(g.kind === "outside" ? t.blocked : t.foreground).child(GROUP_TITLE[g.kind]))
       .when(Boolean(action), (e) => e.child(action))
       .child(div().px(6).h(16).flex().items_center().rounded(8).bg(t.raised).text_color(t.muted).text_size(10).child(String(g.items.length))), id);
   }
 
-  dirRow(group, { dir, name, depth, paths }, t) {
-    const id = `dir-${group}|${dir}`, key = `${group}:${dir}`, open = !this.collapsed.has(key);
-    const action = this.hovered === id ? this.rowAction(group, id, paths, t, `${paths.length} file${paths.length === 1 ? "" : "s"} in ${dir}`) : null;
-    return this.hoverable(h_flex().id(id).h(24).flex_none().pl(20 + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
+  dirRow(g, { dir, name, depth, paths }, t) {
+    const id = `dir-${g.id}|${dir}`, key = `${g.id}:${dir}`, open = !this.collapsed.has(key);
+    const action = this.hovered === id ? this.rowAction(g, id, paths, t, `${paths.length} file${paths.length === 1 ? "" : "s"} in ${dir}`) : null;
+    return this.hoverable(h_flex().id(id).h(24).flex_none().pl(20 + (this.nest ?? 0) + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => this.toggle(this.collapsed, key, cx))
       .child(icon(open ? "chevron-down" : "chevron-right", 16).text_color(t.muted))
       .child(folderIcon(FT, open, name))
@@ -950,14 +1222,14 @@ export default class Changes extends View {
       .child(div().size(6).mx(4).flex_none().rounded(3).bg(t.dim)), id);
   }
 
-  fileRow(group, f, depth, t) {
-    const key = `${group}|${f.path}`, parts = f.path.split("/"), name = parts.pop();
-    const action = this.hovered === key ? this.rowAction(group, key, [f.path], t, f.fresh ? `${name} (new file, will be deleted)` : name) : null;
+  fileRow(g, f, depth, t) {
+    const key = `${g.id}|${f.path}`, parts = f.path.split("/"), name = parts.pop();
+    const action = this.hovered === key ? this.rowAction(g, key, [f.path], t, f.fresh ? `${name} (new file, will be deleted)` : name) : null;
     const compare = this.hovered === key ? div().id(`compare-${key}`).size(22).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
       .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.compare(key, cx))
       .child(svg("mods/diff-view/split.svg").size(16)) : null;
-    return this.hoverable(h_flex().id(key).h(24).flex_none().pl(20 + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer()
+    return this.hoverable(h_flex().id(key).h(24).flex_none().pl(20 + (this.nest ?? 0) + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer()
       .when(this.open === key, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((e, cx) => { if (e.click_count === 2) this.compare(key, cx); else this.pick(key, cx); })
       // In the tree a file lines up under its folder's icon, past the chevron column.
       .when(this.tree, (e) => e.child(div().w(16).flex_none()))
@@ -1031,7 +1303,7 @@ export default class Changes extends View {
     catch { return null; }
   }
   search(cx) {
-    const q = this.query, root = this.root, on = this.on;
+    const q = this.query, root = this.root, on = this.repo()?.on ?? null;
     if (!root || q.length < 2) {
       this.findRun++; this.found = null; this.finding = false;
       this.findNote = !root ? "Not a git repository" : q ? "Type at least 2 characters" : null;
@@ -1060,7 +1332,7 @@ export default class Changes extends View {
           files.get(path).push({ line: Number(rec.slice(a + 1, b)), text: untab(rec.slice(b + 1)).slice(0, 500) });
           count++;
         }
-        this.found = { query: q, matchCase, regex, root, files: [...files].map(([path, hits]) => ({ path, hits })), count, capped };
+        this.found = { query: q, matchCase, regex, root, on, files: [...files].map(([path, hits]) => ({ path, hits })), count, capped };
         this.findAt = null;
       } catch (e) { if (seq === this.findRun) { this.found = null; this.findNote = String(e?.message ?? e); } }
       finally { if (seq === this.findRun) { this.finding = false; cx.notify(); } }
@@ -1089,7 +1361,7 @@ export default class Changes extends View {
       left: this.hasHead ? "HEAD" : "none", right: "worktree", leftLabel: this.hasHead ? "HEAD" : "Empty", rightLabel: "Working tree",
       line: f === file ? hit.line : f.hits[0]?.line, find: found.query }));
     const index = found.files.indexOf(file);
-    openOverlay({ mod: "diff-view", kind: "dialog", width: 0.94, height: 0.92, props: { root: found.root, on: this.on, files, index, edit: false } });
+    openOverlay({ mod: "diff-view", kind: "dialog", width: 0.94, height: 0.92, props: { root: found.root, on: found.on, files, index, edit: false } });
     cx.notify();
   }
   // A match's line, the matching parts marked.
@@ -1161,17 +1433,26 @@ export default class Changes extends View {
     const at = session?.at ? new Date(session.at) : null;
     const since = at ? `${at.getHours()}:${String(at.getMinutes()).padStart(2, "0")}` : null;
     const fpane = (() => { const f = focused(); return f?.pane ? panes().find((p) => p.pane === f.pane) : null; })();
-    const prog = fpane?.program, repo = this.root?.split("/").pop();
+    const prog = fpane?.program, active = this.repo(), many = this.repos.length > 1;
+    const repo = many ? `${this.repos.length} repos` : active?.name;
+    const tracked = session ? sessionRoots(session).length > 0 : false;
     const followIcon = prog?.icon ? (prog.tint ? svg(prog.icon).size(12).flex_none().text_color(t.muted) : image(prog.icon).size(12).flex_none()) : null;
-    const following = repo ? [prog?.name || (fpane?.terminal ? "Terminal" : null), repo, session?.root ? `since ${since}${session.live ? "" : " (ended)"}` : null].filter(Boolean).join(" · ") : null;
+    const following = repo ? [prog?.name || (fpane?.terminal ? "Terminal" : null), repo, tracked ? `since ${since}${session.live ? "" : " (ended)"}` : null].filter(Boolean).join(" · ") : null;
     const staged = this.group("staged").length + this.group("outside").length, total = this.groups.reduce((n, g) => n + g.items.length, 0);
+    const stagedElsewhere = this.repos.filter((r) => r !== active).map((r) => [r, this.group("staged", r).length + this.group("outside", r).length]).filter(([, n]) => n);
     const canCommit = Boolean(this.message.trim() && staged && this.root && !this.busy && !this.loading && !this.generating);
     const rows = [];
-    for (const g of this.groups) {
-      rows.push({ group: g });
-      if (this.collapsedGroups.has(g.id)) continue;
-      const items = this.tree ? treeRows(buildTree(g.items), this.collapsed, g.id) : g.items.map((file) => ({ file, depth: 0 }));
-      for (const row of items) rows.push({ ...row, in: g.id });
+    this.nest = many ? 14 : 0;
+    for (const r of this.repos) {
+      if (many) { rows.push({ repo: r }); if (this.foldedRepos.has(r.root)) continue; }
+      for (const g of r.groups) {
+        // A repo with nothing for this session shows just its header.
+        if (many && !g.items.length) continue;
+        rows.push({ group: g });
+        if (this.groupFolded(g)) continue;
+        const items = this.tree ? treeRows(buildTree(g.items), this.collapsed, g.id) : g.items.map((file) => ({ file, depth: 0 }));
+        for (const row of items) rows.push({ ...row, in: g });
+      }
     }
     const empty = this.error || (this.loading ? "Loading changes…" : !this.root ? "No folder" : this.mode === "session" ? "This session hasn't changed anything yet" : "No changes");
     const root = v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
@@ -1209,7 +1490,8 @@ export default class Changes extends View {
         .when(!this.searching, (e) => e.child(this.iconButton("view", this.tree ? "list-flat" : "list-tree", (cx) => this.toggleTree(cx), t)))
         // The repo's history as a graph (mods/git-graph); only in a git repository.
         .when(!this.searching && Boolean(this.root), (e) => e.child(this.iconButton("graph", "graph", () =>
-          openOverlay({ mod: "git-graph", kind: "dialog", width: 0.94, height: 0.92, props: { root: this.root, on: this.on } }), t)))
+          openOverlay({ mod: "git-graph", kind: "dialog", width: 0.94, height: 0.92, props: { root: this.root, on: active?.on ?? null } }), t)
+          .tooltip(many ? `History of ${active?.name}` : "History")))
         .child(this.iconButton("refresh", "refresh", (cx) => this.searching ? this.search(cx) : this.refresh(cx), t));
     if (this.searching) return root.child(header).child(this.searchBody(t));
     return root.child(header)
@@ -1217,7 +1499,7 @@ export default class Changes extends View {
       .when(Boolean(following), (el) => el.child(h_flex().h(22).flex_none().px(14).gap(6).items_center().text_size(11).text_color(t.dim)
         .when(Boolean(followIcon), (e) => e.child(followIcon))
         .child(div().flex_1().min_w(0).truncate().child(following))
-        .when(Boolean(session?.root), (e) => e.child(div().id("session-restart").px(6).rounded(4).cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .when(tracked, (e) => e.child(div().id("session-restart").px(6).rounded(4).cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
           .on_click((_e, cx) => this.restart(cx)).child("Start over")))))
       .child(this.generating ? this.generatingBox(t) : h_flex().id("commit-message").mx(10).mt(4).h(32).flex_none().pl(10).pr(4).gap(4).items_center().rounded(6).border_1()
         .border_color(this.genDone ? t.ansi2 : this.typing ? t.accent : t.border).cursor_text()
@@ -1228,9 +1510,10 @@ export default class Changes extends View {
       .child(h_flex().id("commit").mx(10).mt(8).h(30).flex_none().gap(6).items_center().justify_center().rounded(6).text_size(13)
         .bg(canCommit ? t.solid : t.raised).text_color(canCommit ? t.solid_foreground : t.dim).when(canCommit, (e) => e.cursor_pointer())
         .on_click((_e, cx) => this.commit(cx))
-        .child(icon("check", 16)).child(this.busy ? "Working…" : this.generating ? "Waiting for message…" : "Commit"))
+        .child(icon("check", 16)).child(div().min_w(0).truncate().child(this.busy ? "Working…" : this.generating ? "Waiting for message…" : many ? `Commit to ${active?.name}` : "Commit")))
       .when(total > 0, (el) => el.child(div().px(14).pt(4).text_size(11).text_color(t.dim)
-        .child(staged ? `${staged} staged${this.group("outside").length ? ` · ${this.group("outside").length} from outside this session` : ""}` : "Nothing staged · stage files with +")))
+        .child([staged ? `${staged} staged${many ? ` in ${active?.name}` : ""}${this.group("outside").length ? ` · ${this.group("outside").length} from outside this session` : ""}` : `Nothing staged${many ? ` in ${active?.name}` : ""} · stage files with +`,
+          ...stagedElsewhere.map(([r, n]) => `${n} staged in ${r.name}`)].join(" · "))))
       // Discard asks here first, as VS Code's dialog does: it can't be undone.
       .when(Boolean(this.confirming), (el) => el.child(v_flex().id("discard-confirm").mx(10).mt(8).p(8).gap(8).flex_none().rounded(6)
         .border_1().border_color(t.ansi1).bg(t.ansi1 + "1a").text_size(12)
@@ -1246,10 +1529,10 @@ export default class Changes extends View {
       .child(div().id("changes-list-box").mt(8).min_h(44).relative().border_t(1).border_color(t.border)
         .on_size_change((size) => { this.listMeasured = size.height; })
         .when(!this.preview, (e) => e.flex_1().border_b(1))
-        .when(this.preview && this.listH === null, (e) => e.flex_1().max_h(rows.length * 24 + 12 + (total ? 0 : 48)))
+        .when(this.preview && this.listH === null, (e) => e.flex_1().max_h(rows.reduce((h, row) => h + (row.repo ? 44 : 24), 0) + 12 + (total ? 0 : 48)))
         .when(this.preview && this.listH !== null, (e) => e.flex_none().h(Math.min(this.listH, Math.max(44, this.panelH - 160))))
         .child(v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6)
-          .children(rows.map((row) => row.group ? this.groupRow(row.group, t) : row.file ? this.fileRow(row.in, row.file, row.depth, t) : this.dirRow(row.in, row, t)))
+          .children(rows.map((row) => row.repo ? this.repoRow(row.repo, t) : row.group ? this.groupRow(row.group, t, many) : row.file ? this.fileRow(row.in, row.file, row.depth, t) : this.dirRow(row.in, row, t)))
           .when(!total, (e) => e.child(div().px(8).py(4).text_size(12).text_color(t.dim).child(empty))))
         .child(Scrollbar.vertical("changes-list").absolute().inset_0()))
       .when(this.limited, el => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child("Showing the first 1,000 files of a group")))
@@ -1266,7 +1549,7 @@ export default class Changes extends View {
         // The diff's own bar: which file, open it side by side, put the preview away.
         .child(h_flex().h(30).flex_none().pl(12).pr(6).gap(4).items_center().border_b(1).border_color(t.border).text_size(11.5)
           .child(div().flex_1().min_w(0).truncate().text_color(this.open ? t.muted : t.dim)
-            .child(this.open ? this.item(this.open).path : total > 0 ? "Select a file to view its changes" : ""))
+            .child(this.open ? (many ? `${this.item(this.open).repo?.name ?? ""} › ` : "") + this.item(this.open).path : total > 0 ? "Select a file to view its changes" : ""))
           .when(Boolean(this.open && this.item(this.open).item), (e) => e.child(h_flex().id("compare-open").h(22).px(7).gap(5).flex_none().items_center()
             .rounded(5).text_color(t.muted).cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.compare(this.open, cx))
