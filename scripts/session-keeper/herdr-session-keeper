@@ -1,32 +1,43 @@
 #!/usr/bin/env python3
 """Bring Herdr agent sessions back after a reboot / core restart.
 
-herdr-core already keeps the layout (docs.json) and gives every kept terminal a
-fresh shell when the core starts again. What is lost is the program that was
-running inside: Claude Code, Codex, Antigravity (agy), cursor-agent.
+herdr-core already keeps the layout and gives every kept terminal a fresh shell
+when the core starts again. What is lost is the program that was running inside:
+Claude Code, Codex, Antigravity (agy), cursor-agent.
 
-This watcher records, every few seconds, which agent runs in each terminal and
-its session id (~/.local/state/herdr-session-keeper/agents.json). When a
-terminal's program has been restarted by herdr (new program_started_ms) and it
-now sits in a bare shell, it types the resume command into it:
+This watcher is event-driven (no polling):
+  * `herdr-core events`: an agent starting or exiting in a terminal is a
+    `foreground` event, a closed terminal is `finished`. When the core comes
+    back, the new stream opens with a snapshot: terminals whose shell is new
+    (different pid than when the agent ran) get the resume command typed in.
+  * inotify on ~/.claude/sessions: Claude rewrites <pid>.json when its session
+    id changes (/clear, /resume), so the recorded id follows at once.
+  * inotify on the core's socket folder: the stream is only (re)opened when the
+    core is up, so this never starts the core itself.
+Codex / agy / cursor-agent ids are re-read on that terminal's own status and
+title events (debounced), which arrive as soon as a session writes its file.
 
   claude --resume <id>        (through the user's `claude` shell function)
   codex  resume <id>          (or `codex resume --last` when the id is unknown)
   agy    --conversation <id>  (or `agy --continue`)
   cursor-agent --resume <id>
 
-Quitting an agent yourself (shell still alive) forgets it, so only agents that
-were running when the machine went down come back.
+Quitting an agent yourself (shell still alive 9 s later) forgets it, so only
+agents that were running when the machine went down come back.
 
   --status   print what is recorded
   --dry-run  log what would be restored, type nothing
 """
-import json, os, re, shlex, signal, subprocess, sys, time
+import ctypes, json, os, re, select, shlex, signal, struct, subprocess, sys, time
 
-POLL = 3.0
 FORGET_AFTER = 9.0          # agent gone this long while its shell lives = user quit it
-SETTLE_MS = 2500            # let a fresh shell read its rc files before typing
+SETTLE = 2.5                # let a fresh shell read its rc files before typing
+DEBOUNCE = 2.0              # coalesce title/status/session-file bursts per terminal
 CORE = os.path.expanduser("~/.local/state/herdr-core/default")
+RUN = f"/run/user/{os.getuid()}"
+SOCK_DIR = os.path.join(RUN, "herdr-core")
+SOCK = os.path.join(SOCK_DIR, "default.sock")
+CLAUDE_SESSIONS = os.path.expanduser("~/.claude/sessions")
 STATE_DIR = os.path.expanduser("~/.local/state/herdr-session-keeper")
 STATE = os.path.join(STATE_DIR, "agents.json")
 SHELLS = {"bash", "zsh", "sh", "fish", "dash", "nu"}
@@ -41,7 +52,7 @@ CODEX_KEEP = {"-m": 1, "--model": 1, "-c": 1, "--config": 1, "-p": 1, "--profile
               "--disable": 1, "--no-daemon": 0, "--full-auto": 0, "--search": 0,
               "--dangerously-bypass-approvals-and-sandbox": 0}
 DRY = "--dry-run" in sys.argv
-stopping = False
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def log(*a):
@@ -56,20 +67,54 @@ def load(path, default):
         return default
 
 
-def save(state):
-    os.makedirs(STATE_DIR, exist_ok=True)
-    tmp = STATE + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=1)
-    os.replace(tmp, STATE)
-
-
 def system_stopping():
     try:
         r = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True, timeout=3)
         return r.stdout.strip() == "stopping"
     except Exception:
         return False
+
+
+# ---------- inotify (ctypes, no extra packages) ----------
+
+IN_MODIFY, IN_CLOSE_WRITE, IN_MOVED_TO, IN_CREATE, IN_DELETE = 0x2, 0x8, 0x80, 0x100, 0x200
+IN_DELETE_SELF, IN_IGNORED = 0x400, 0x8000
+_libc = ctypes.CDLL("libc.so.6", use_errno=True)
+
+
+class Inotify:
+    def __init__(self):
+        self.fd = _libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        if self.fd < 0:
+            raise OSError(ctypes.get_errno(), "inotify_init1")
+        self.paths = {}
+
+    def watch(self, path, mask):
+        if path in self.paths.values():
+            return True
+        wd = _libc.inotify_add_watch(self.fd, path.encode(), mask)
+        if wd < 0:
+            return False
+        self.paths[wd] = path
+        return True
+
+    def read(self):
+        out = []
+        try:
+            buf = os.read(self.fd, 65536)
+        except BlockingIOError:
+            return out
+        i = 0
+        while i + 16 <= len(buf):
+            wd, mask, _cookie, n = struct.unpack_from("iIII", buf, i)
+            name = buf[i + 16:i + 16 + n].split(b"\0", 1)[0].decode(errors="replace")
+            i += 16 + n
+            path = self.paths.get(wd)
+            if mask & IN_IGNORED:
+                self.paths.pop(wd, None)
+            if path:
+                out.append((path, name, mask))
+        return out
 
 
 # ---------- processes ----------
@@ -105,14 +150,20 @@ def agent_kind(p):
     return kind
 
 
-def scan_agents(terms):
-    """terminal address -> agent proc (outermost agent whose ancestors lead to the terminal's shell)."""
+def all_procs():
     procs = {}
     for pid in filter(str.isdigit, os.listdir("/proc")):
         p = proc_info(pid)
         if p:
             procs[p["pid"]] = p
-    shell_pid = {a: t.get("pid") for a, t in terms.items() if t.get("state") == "live" and t.get("pid")}
+    return procs
+
+
+def find_agents(terms, only=None):
+    """terminal -> outermost agent proc whose ancestors lead to the terminal's shell."""
+    procs = all_procs()
+    shell_pid = {a: t.get("pid") for a, t in terms.items()
+                 if t.get("state") == "live" and t.get("pid") and (only is None or a in only)}
     out = {}
     for p in procs.values():
         kind = agent_kind(p)
@@ -121,7 +172,6 @@ def scan_agents(terms):
         t = env_of(p["pid"]).get("HC_TERMINAL_ID")
         if not t or t not in shell_pid:
             continue
-        # walk up: must reach the terminal's program without passing another agent
         cur, ok = procs.get(p["ppid"]), False
         while cur:
             if cur["pid"] == shell_pid[t]:
@@ -155,28 +205,26 @@ def fd_targets(pid):
     return out
 
 
-UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-_rollout_cwd = {}
+_rollout = {}
 
 
 def rollout_meta(path):
-    if path not in _rollout_cwd:
+    if path not in _rollout:
         try:
             with open(path) as f:
                 m = json.loads(f.readline()).get("payload", {})
-            _rollout_cwd[path] = (m.get("id") or m.get("session_id"), m.get("cwd"))
+            _rollout[path] = (m.get("id") or m.get("session_id"), m.get("cwd"))
         except (OSError, ValueError):
             return None, None
-    return _rollout_cwd[path]
+    return _rollout[path]
 
 
-def codex_rollouts(pids):
-    """Rollout files currently open by any codex process (TUI or app-server daemon)."""
+def codex_daemon_rollouts():
     files = set()
-    for pid in pids:
-        for t in fd_targets(pid):
-            if os.path.basename(t).startswith("rollout-") and t.endswith(".jsonl"):
-                files.add(t)
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        p = proc_info(pid)
+        if p and p["argv"][1:2] == ["app-server"] and os.path.basename(p["argv"][0]) == "codex":
+            files |= {t for t in fd_targets(pid) if os.path.basename(t).startswith("rollout-") and t.endswith(".jsonl")}
     return files
 
 
@@ -186,20 +234,28 @@ def recent_rollouts(since_s):
     for day in sorted({time.strftime("%Y/%m/%d", time.localtime(t)) for t in (since_s, time.time())}):
         d = os.path.join(root, day)
         try:
-            for n in os.listdir(d):
-                if n.startswith("rollout-") and n.endswith(".jsonl"):
-                    out.append(os.path.join(d, n))
+            out += [os.path.join(d, n) for n in os.listdir(d) if n.startswith("rollout-") and n.endswith(".jsonl")]
         except OSError:
             pass
     return out
 
 
-def session_id(p, boot_s, codex_open):
-    kind, pid = p["kind"], p["pid"]
+def boot_seconds():
+    for line in open("/proc/stat"):
+        if line.startswith("btime"):
+            return int(line.split()[1])
+    return 0
+
+
+BOOT = boot_seconds()
+
+
+def session_id(e):
+    kind, pid = e["kind"], e["pid"]
     if kind == "claude":
         for _ in range(3):
-            s = load(os.path.expanduser(f"~/.claude/sessions/{pid}.json"), None)
-            if s and str(s.get("procStart")) == p["start"]:
+            s = load(os.path.join(CLAUDE_SESSIONS, f"{pid}.json"), None)
+            if s and str(s.get("procStart")) == e["start"]:
                 return s.get("sessionId")
             if s is None:
                 time.sleep(0.05)
@@ -208,10 +264,10 @@ def session_id(p, boot_s, codex_open):
         mine = [t for t in fd_targets(pid) if os.path.basename(t).startswith("rollout-")]
         if mine:
             return rollout_meta(mine[0])[0]
-        # daemon mode: rollout lives in the app-server; match by cwd, newest first
-        started = boot_s + int(p["start"]) / os.sysconf("SC_CLK_TCK")
-        cands = [f for f in codex_open | set(recent_rollouts(started)) if os.path.exists(f)]
-        cands = [f for f in cands if rollout_meta(f)[1] == p.get("cwd") and os.path.getmtime(f) >= started]
+        # daemon mode: the rollout lives in the app-server; match by cwd, newest first
+        started = BOOT + int(e["start"]) / os.sysconf("SC_CLK_TCK")
+        cands = [f for f in codex_daemon_rollouts() | set(recent_rollouts(started)) if os.path.exists(f)]
+        cands = [f for f in cands if rollout_meta(f)[1] == e.get("cwd") and os.path.getmtime(f) >= started]
         cands.sort(key=os.path.getmtime, reverse=True)
         return rollout_meta(cands[0])[0] if cands else None
     if kind == "agy":
@@ -227,7 +283,6 @@ def session_id(p, boot_s, codex_open):
                 m = UUID.search(t)
                 if m:
                     return m.group(0)
-        return None
     return None
 
 
@@ -262,112 +317,271 @@ def resume_cmd(e):
     return line
 
 
-# ---------- main loop ----------
-
-def boot_seconds():
-    for line in open("/proc/stat"):
-        if line.startswith("btime"):
-            return int(line.split()[1])
-    return 0
-
-
 def layout_terminals():
     doc = load(os.path.join(CORE, "docs.json"), None)
-    if doc is None:
-        return None
-    return set(re.findall(r'"terminal":\s*"([^"]+)"', json.dumps(doc)))
+    return None if doc is None else set(re.findall(r'"terminal":\s*"([^"]+)"', json.dumps(doc)))
 
 
-def tick(state, boot_s):
-    terms = {t["address"]: t for t in load(os.path.join(CORE, "terminals.json"), {}).get("terminals", {}).values()}
-    if not terms:
+# ---------- the keeper ----------
+
+class Keeper:
+    def __init__(self):
+        self.state = load(STATE, {})      # terminal -> recorded agent
+        self.terms = {}                   # terminal -> live facts from the event stream
+        self.timers = {}                  # (kind, terminal) -> due (monotonic)
+        self.stream = None
+        self.buf = b""
+        self.stopping = False
+
+    # --- persistence
+    def save(self):
+        if DRY:
+            return
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.state, f, indent=1)
+        os.replace(tmp, STATE)
+
+    def later(self, kind, t, delay):
+        self.timers.setdefault((kind, t), time.monotonic() + delay)
+
+    # --- recording
+    def record(self, only=None):
+        """Re-read which agent runs in each (or the given) terminal."""
+        found = find_agents(self.terms, only)
+        changed = False
+        for t, p in found.items():
+            old = self.state.get(t, {})
+            same = old.get("pid") == p["pid"] and old.get("start") == p["start"]
+            e = {"kind": p["kind"], "argv": p["argv"], "cwd": p.get("cwd"), "pid": p["pid"],
+                 "start": p["start"], "shell_pid": self.terms[t].get("pid"),
+                 "where": self.terms[t].get("labels", {}).get("where"),
+                 "session": old.get("session") if same else None}
+            e["session"] = session_id(e) or e["session"]
+            self.timers.pop(("forget", t), None)
+            if {k: v for k, v in old.items() if k != "restored"} != e:
+                if old.get("session") != e["session"] or not same:
+                    log(f"{t}: {e['kind']} {e['session'] or '(no id yet)'} in {e['cwd']}")
+                if "restored" in old:
+                    e["restored"] = old["restored"]
+                self.state[t] = e
+                changed = True
+        for t in (only if only is not None else list(self.terms)):
+            if t in self.state and t not in found:
+                self.later("forget", t, FORGET_AFTER)
+        return changed
+
+    def refresh_id(self, t):
+        e = self.state.get(t)
+        if not e:
+            return False
+        if not os.path.exists(f"/proc/{e['pid']}"):
+            return self.record({t})
+        sid = session_id(e)
+        if sid and sid != e.get("session"):
+            log(f"{t}: {e['kind']} session -> {sid}")
+            e["session"] = sid
+            return True
         return False
-    in_layout = layout_terminals()
-    agents = scan_agents(terms)
-    codex_pids = [p["pid"] for p in agents.values() if p["kind"] == "codex"]
-    codex_pids += [int(x) for x in filter(str.isdigit, os.listdir("/proc"))
-                   if (proc_info(x) or {}).get("argv", [""])[1:2] == ["app-server"]]
-    codex_open = codex_rollouts(codex_pids)
-    now_ms = int(time.time() * 1000)
-    changed = False
 
-    # 1. record running agents
-    for addr, p in agents.items():
-        t = terms[addr]
-        sid = session_id(p, boot_s, codex_open)
-        old = state.get(addr, {})
-        e = {"kind": p["kind"], "session": sid or (old.get("session") if old.get("pid") == p["pid"] else None),
-             "argv": p["argv"], "cwd": p.get("cwd"), "pid": p["pid"], "start": p["start"],
-             "term_started": t.get("program_started_ms"), "shell_pid": t.get("pid"),
-             "where": t.get("labels", {}).get("where"), "seen": now_ms}
-        if {k: v for k, v in e.items() if k != "seen"} != {k: v for k, v in old.items() if k not in ("seen", "missing")}:
-            if old.get("session") != e["session"] or old.get("kind") != e["kind"]:
-                log(f"{addr}: {e['kind']} {e['session'] or '(no id yet)'} in {e['cwd']}")
-            changed = True
-        elif now_ms - old.get("seen", 0) > 60000:
-            changed = True
-        state[addr] = e
+    # --- forgetting / restoring
+    def forget(self, t):
+        e, f = self.state.get(t), self.terms.get(t)
+        if not e or self.stopping or self.stream is None or system_stopping():
+            return False
+        lay = layout_terminals()
+        if (f is None or f.get("state") != "live") and lay is not None and t not in lay:
+            log(f"{t}: terminal closed, forgetting {e['kind']}")
+        elif f and f.get("state") == "live" and f.get("pid") == e.get("shell_pid") \
+                and os.path.exists(f"/proc/{f.get('pid')}") and t not in find_agents(self.terms, {t}):
+            log(f"{t}: {e['kind']} exited, forgetting")
+        else:
+            return False
+        del self.state[t]
+        return True
 
-    # 2. forget / restore the rest
-    for addr in list(state):
-        if addr in agents:
-            continue
-        e, t = state[addr], terms.get(addr)
-        if in_layout is not None and addr not in in_layout and (t is None or t.get("state") != "live"):
-            log(f"{addr}: terminal closed, forgetting {e['kind']}")
-            del state[addr]
-            changed = True
-            continue
-        if not t or t.get("state") != "live":
-            continue  # core down / terminal parked: keep it for later
-        fg = (t.get("foreground") or {}).get("name") or ""
-        restarted = (t.get("program_started_ms") or 0) > (e.get("term_started") or 0)
-        if not restarted:
-            # same shell as when the agent ran: did the user quit the agent?
-            if t.get("pid") == e.get("shell_pid") and os.path.exists(f"/proc/{t.get('pid')}") and fg in SHELLS:
-                e.setdefault("missing", now_ms)
-                if now_ms - e["missing"] >= FORGET_AFTER * 1000 and not stopping and not system_stopping():
-                    log(f"{addr}: {e['kind']} exited, forgetting")
-                    del state[addr]
-                    changed = True
-            continue
-        if fg not in SHELLS or now_ms - (t.get("program_started_ms") or now_ms) < SETTLE_MS:
-            continue
-        if e.get("restored") == t.get("program_started_ms"):
-            continue  # already typed into this shell; give it time to show up
+    def check_restore(self, t):
+        e, f = self.state.get(t), self.terms.get(t)
+        if not e or not f or f.get("state") != "live" or f.get("pid") == e.get("shell_pid"):
+            return
+        if e.get("restored") == f.get("pid"):
+            return
+        self.later("restore", t, SETTLE)
+
+    def restore(self, t):
+        e, f = self.state.get(t), self.terms.get(t)
+        if not e or not f or f.get("state") != "live" or f.get("pid") == e.get("shell_pid"):
+            return False
+        if e.get("restored") == f.get("pid") or (f.get("foreground") or {}).get("name") not in SHELLS:
+            return False
         line = resume_cmd(e)
-        log(f"{addr} ({e.get('where')}): restoring -> {line}")
+        log(f"{t} ({e.get('where')}): restoring -> {line}")
         if not DRY:
-            r = subprocess.run(["herdr-core", "send", addr, line], capture_output=True, text=True, timeout=20)
+            r = subprocess.run(["herdr-core", "send", t, line], capture_output=True, text=True, timeout=20)
             if r.returncode != 0:
-                log(f"{addr}: send failed: {r.stderr.strip() or r.stdout.strip()}")
+                log(f"{t}: send failed: {r.stderr.strip() or r.stdout.strip()}")
+                return False
+        e["restored"] = f.get("pid")
+        return True
+
+    # --- event stream
+    def open_stream(self):
+        if self.stream is not None or not os.path.exists(SOCK):
+            return
+        self.stream = subprocess.Popen(["herdr-core", "events", "--json"], stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        os.set_blocking(self.stream.stdout.fileno(), False)
+        self.buf = b""
+        log("connected to herdr-core")
+
+    def close_stream(self):
+        if self.stream:
+            try:
+                self.stream.kill()
+                self.stream.wait(timeout=2)
+            except Exception:
+                pass
+        self.stream = None
+        self.terms = {}
+        # the core went away: nothing is "quit by the user" right now
+        for k in [k for k in self.timers if k[0] in ("forget", "restore", "id")]:
+            del self.timers[k]
+        log("herdr-core stream ended; waiting for the core")
+
+    def get_terminal(self, t):
+        try:
+            r = subprocess.run(["herdr-core", "get", t, "--json"], capture_output=True, text=True, timeout=10)
+            d = json.loads(r.stdout)
+            return d.get("terminal", d) if isinstance(d, dict) else None
+        except Exception:
+            return None
+
+    def on_line(self, line):
+        d = json.loads(line)
+        changed = False
+        if "terminals" in d:                       # snapshot at (re)connect
+            self.terms = {t["address"]: t for t in d["terminals"]}
+            changed |= self.record()
+            for t in list(self.state):
+                if t not in self.terms:
+                    self.later("forget", t, FORGET_AFTER)
+                else:
+                    self.check_restore(t)
+            return changed
+        ev = d.get("params", {})
+        t, kind, data = ev.get("terminal"), ev.get("type"), ev.get("data") or {}
+        if not t:
+            return False
+        if t not in self.terms:                    # a terminal made after the snapshot
+            self.terms[t] = self.get_terminal(t) or {"address": t}
+        f = self.terms[t]
+        if kind == "foreground":
+            f["foreground"] = data
+            changed |= self.record({t})
+            self.check_restore(t)
+        elif kind == "finished":
+            f.update(data, state="finished")
+            if t in self.state:
+                self.later("forget", t, FORGET_AFTER)
+        elif kind in ("title", "status", "turn", "size", "seen", "labels"):
+            if kind == "title":
+                f["title"] = data.get("title")
+            if kind == "labels":
+                f.setdefault("labels", {}).update(data)
+            if t in self.state and kind in ("title", "status", "turn"):
+                self.later("id", t, DEBOUNCE)
+        else:                                      # started / restarted / anything new: re-read it
+            fresh = self.get_terminal(t)
+            if fresh:
+                self.terms[t] = fresh
+                changed |= self.record({t})
+                self.check_restore(t)
+        return changed
+
+    def read_stream(self):
+        changed = False
+        try:
+            chunk = os.read(self.stream.stdout.fileno(), 65536)
+        except BlockingIOError:
+            return False
+        if not chunk:
+            self.close_stream()
+            return False
+        self.buf += chunk
+        while b"\n" in self.buf:
+            line, self.buf = self.buf.split(b"\n", 1)
+            if line.strip():
+                try:
+                    changed |= self.on_line(line)
+                except ValueError:
+                    pass
+        return changed
+
+    # --- main loop
+    def run(self):
+        ino = Inotify()
+
+        def arm():
+            ino.watch(RUN, IN_CREATE)
+            ino.watch(SOCK_DIR, IN_CREATE | IN_MOVED_TO | IN_DELETE | IN_DELETE_SELF)
+            if os.path.isdir(CLAUDE_SESSIONS):
+                ino.watch(CLAUDE_SESSIONS, IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE)
+            else:
+                ino.watch(os.path.dirname(CLAUDE_SESSIONS), IN_CREATE)
+        arm()
+
+        def on_term(*_):
+            self.stopping = True
+        signal.signal(signal.SIGTERM, on_term)
+        signal.signal(signal.SIGINT, on_term)
+        log(f"watching; {len(self.state)} recorded agent(s)" + (" [dry run]" if DRY else ""))
+
+        while not self.stopping:
+            self.open_stream()
+            fds = [ino.fd] + ([self.stream.stdout] if self.stream else [])
+            due = min(self.timers.values(), default=None)
+            timeout = None if due is None else max(0.0, due - time.monotonic())
+            try:
+                ready, _, _ = select.select(fds, [], [], timeout)
+            except InterruptedError:
                 continue
-        e["restored"] = t.get("program_started_ms")
-        changed = True
-    return changed
+            changed = False
+            if self.stream and self.stream.stdout in ready:
+                changed |= self.read_stream()
+            if ino.fd in ready:
+                for path, name, mask in ino.read():
+                    if path in (RUN, os.path.dirname(CLAUDE_SESSIONS)):
+                        arm()                      # herdr-core / sessions folder appeared
+                    elif path == CLAUDE_SESSIONS and name.endswith(".json") and name[:-5].isdigit():
+                        pid = int(name[:-5])
+                        for t, e in self.state.items():
+                            if e.get("pid") == pid:
+                                self.later("id", t, 0.3)
+            now = time.monotonic()
+            for key in [k for k, v in self.timers.items() if v <= now]:
+                del self.timers[key]
+                what, t = key
+                if self.stopping:
+                    break
+                if what == "forget":
+                    changed |= self.forget(t)
+                elif what == "restore":
+                    changed |= self.restore(t)
+                elif what == "id":
+                    changed |= self.refresh_id(t)
+            if changed and not self.stopping:
+                self.save()
+        if self.stream:
+            self.stream.kill()
 
 
 def main():
-    global stopping
     if "--status" in sys.argv:
-        for addr, e in sorted(load(STATE, {}).items()):
-            print(f"{addr:5} {e.get('where') or '':40} {resume_cmd(e)}")
+        for t, e in sorted(load(STATE, {}).items()):
+            print(f"{t:5} {e.get('where') or '':40} {resume_cmd(e)}")
         return
-
-    def on_term(*_):
-        global stopping
-        stopping = True
-    signal.signal(signal.SIGTERM, on_term)
-    state = load(STATE, {})
-    boot_s = boot_seconds()
-    log(f"watching; {len(state)} recorded agent(s)" + (" [dry run]" if DRY else ""))
-    while not stopping:
-        try:
-            if tick(state, boot_s) and not stopping and not DRY:
-                save(state)
-        except Exception as ex:  # never die on a bad read
-            log("tick failed:", repr(ex))
-        time.sleep(POLL)
+    Keeper().run()
 
 
 if __name__ == "__main__":
