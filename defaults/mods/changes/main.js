@@ -548,7 +548,8 @@ export default class Changes extends View {
 
   // A Changes session lives as long as the agent's own session, for every agent CLI (see
   // AGENT_SESSIONS): the same session resumed (after a logout, an app restart, `--resume`,
-  // even in another terminal) keeps it; a new one (a fresh start, /clear) starts over.
+  // even in another terminal) keeps it, and so does /clear in the same process; a fresh start
+  // of the agent starts over.
   // Agents with no session file to read count their process as the session.
   // Ended sessions are kept a few days to review, and to pick up again if resumed.
   trackSessions(cx) {
@@ -568,8 +569,13 @@ export default class Changes extends View {
         const provisional = !s?.agentSession || (s.agentSession.startsWith("proc:") && !id.startsWith("proc:") && s.agentPid === pid);
         if (s?.live && provisional && Array.isArray(s.paths)) { ops.push(["adopt", a.address, id, null, pid]); continue; }
         const from = id.startsWith("proc:") ? null
-          : Object.keys(saved).find((k) => k !== a.address && saved[k].agentSession === id && saved[k].tree && !(saved[k].live && ids[k]?.id === id));
-        ops.push(from ? ["claim", a, id, from] : ["fresh", a, id, null, pid]);
+          : Object.keys(saved).find((k) => k !== a.address && saved[k].agentSession === id && sessionRoots(saved[k]).length && !(saved[k].live && ids[k]?.id === id));
+        if (from) { ops.push(["claim", a, id, from]); continue; }
+        // A new session id in the same process: /clear (or /compact, a new chat in the same
+        // window). Still the same run of the agent, so the Changes session carries on under it.
+        // Only a new process (quitting and starting the agent again) starts over.
+        if (s?.live && Array.isArray(s.paths) && s.agentPid === pid && !id.startsWith("proc:")) { ops.push(["adopt", a.address, id, null, pid]); continue; }
+        ops.push(["fresh", a, id, null, pid]);
         continue;
       }
       // A live session saved before files were credited per agent (no paths) starts over once.
@@ -594,7 +600,7 @@ export default class Changes extends View {
       const archive = (k) => {
         const s = next[k];
         delete next[k];
-        if (s?.agentSession && s.tree) next[`${k}~${s.agentSession}`] = { ...s, live: false, ended: s.ended ?? Date.now() };
+        if (s?.agentSession && sessionRoots(s).length) next[`${k}~${s.agentSession}`] = { ...s, live: false, ended: s.ended ?? Date.now() };
       };
       for (const [kind, x, id, from, pid] of ops) {
         if (kind === "end") { if (next[x]?.live) next[x] = { ...next[x], live: false, ended: Date.now() }; }
