@@ -13,6 +13,8 @@ const SELF = "menu";
 // Space groups (shared with the spaces sidebar): [{ id, name, folded, spaces: [space ids] }].
 const GROUPS = "spaces.groups";
 const groups = () => shared(GROUPS) ?? [];
+// Asks the spaces sidebar to pick a folder for a new space (a fresh number each time).
+const PICK = "spaces.pick";
 // A space is in at most one group; `group` null takes it out of all.
 function setGroup(space, group, list = groups()) {
   setShared(GROUPS, list.map((g) => ({ ...g, spaces: [...(g.spaces ?? []).filter((id) => id !== space), ...(g.id === group ? [space] : [])] })));
@@ -102,6 +104,15 @@ function items(p, git) {
         ["Rename group", "group.rename", { group: tg.id }],
         ["Delete group", "group.delete", { group: tg.id }],
       ];
+    // The sidebar's +: a space from a picked folder, or a copy of the active one.
+    case "newSpace": {
+      const active = spaces().find((s) => s.active);
+      const name = active && (active.name || place(active).replace(/\/+$/, "").split("/").pop());
+      return [
+        ["Open folder…", "space.pick", {}],
+        ...(active ? [[`Duplicate ${name}`, "space.new", { machine: active.machine ?? "" }]] : []),
+      ];
+    }
     default:
       return [
         ["New space", "space.new", {}],
@@ -116,6 +127,7 @@ function items(p, git) {
 
 function menuIcon(command) {
   if (command.startsWith("group.")) return `mods/workspace-chrome/${{ move: "folder", leave: "minus", new: "folder-plus", rename: "square-pen", delete: "x" }[command.slice(6)]}.svg`;
+  if (command === "space.pick") return "mods/workspace-chrome/folder.svg";
   const name = command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen" : command.endsWith(".new") ? "plus" : command === "worktree" ? "git-branch" : command === "app.help" ? "terminal" : command === "app.theme" ? "settings" : command === "pane.split" ? "panel-right" : command === "pane.zoom" ? "square" : "terminal";
   return `mods/workspace-chrome/${name}.svg`;
 }
@@ -163,6 +175,8 @@ export default class Menu extends View {
     else if (it[1] === "group.new") groupPrompt({ mode: "new", space: a.space });
     else if (it[1] === "group.rename") groupPrompt({ mode: "rename", group: a.group });
     else if (it[1] === "group.delete") setShared(GROUPS, groups().filter((g) => g.id !== a.group));
+    // Closing this popup would cancel a picker it awaits: the sidebar opens it (PICK).
+    else if (it[1] === "space.pick") setShared(PICK, Date.now());
     else if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     else run(it[1], it[2]);
   }

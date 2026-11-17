@@ -5,7 +5,7 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
-import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout } from "herdr";
+import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, pickFolder } from "herdr";
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -55,6 +55,9 @@ const MENU = "menu";
 // way of showing the list: space order stays the app's, each group lists its spaces in it.
 const GROUPS = "spaces.groups";
 const groups = () => shared(GROUPS) ?? [];
+// Set by the menu's "Open folder…" (a fresh number each time): this sidebar opens the picker,
+// since the menu popup closes, and would cancel it, as soon as it's chosen.
+const PICK = "spaces.pick";
 function setGroup(space, group) {
   setShared(GROUPS, groups().map((g) => ({ ...g, spaces: [...(g.spaces ?? []).filter((id) => id !== space), ...(g.id === group ? [space] : [])] })));
 }
@@ -98,9 +101,26 @@ export default class Spaces extends View {
     cx.timer.every(15000, cx => this.refreshMachines(cx));
     // Refresh only when the refs could have changed (see `due`).
     cx.timer.every(250, (cx) => this.checkNew(cx));
+    this.picked = shared(PICK) ?? 0; // the last folder request handled (an older one isn't replayed on reload)
+  }
+
+  // The + menu's "Open folder…": the system folder picker, then a space there (this computer).
+  pickFolder(cx) {
+    if (this.picking) return;
+    this.picking = true;
+    cx.spawn(async () => {
+      try {
+        const folder = await pickFolder({ prompt: "Add space" });
+        if (folder) run("space.new", { folder, machine: "" });
+      } finally {
+        this.picking = false;
+      }
+    });
   }
 
   checkNew(cx) {
+    const pick = shared(PICK) ?? 0;
+    if (pick !== this.picked) { this.picked = pick; this.pickFolder(cx); }
     const now = Date.now();
     const sp = spaces();
     for (const s of sp) if (!this.shown.has(s.id)) this.born[s.id] ??= now;
@@ -614,8 +634,10 @@ export default class Spaces extends View {
             .hover(s => s.bg(t.hover).text_color(t.foreground))
             .on_click(() => openOverlay({ mod: MENU, kind: "dialog", width: 380, height: 190, props: { groupPrompt: { mode: "new" } } }))
             .child(svg("mods/workspace-chrome/folder-plus.svg").size(14))))
-        .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
-          .on_click(() => run("space.new")).child(svg("mods/workspace-chrome/plus.svg").size(14))))
+        .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).tooltip("New space")
+          .hover(s => s.bg(t.hover).text_color(t.foreground))
+          .on_click(() => openOverlay({ mod: MENU, kind: "popup", width: 240, height: 90, props: { tab: "newSpace" } }))
+          .child(svg("mods/workspace-chrome/plus.svg").size(14))))
       .child(v_flex().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
         // A block above (another mod's) growing, or the window resizing, shrinks this list and can push the active space out.
         .on_size_change((_size, cx) => { if (this.activeAt >= 0) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
