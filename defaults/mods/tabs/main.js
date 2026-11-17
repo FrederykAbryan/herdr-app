@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, focused, run, openOverlay, theme, window, shared, setShared, layout, settings } from "herdr";
+import { spaces, panes, focused, run, exec, notify, openOverlay, theme, window, shared, setShared, layout, settings } from "herdr";
 import { discover, current, runningTab, start, stop as stopScript, show } from "./run.js";
 
 function find(node, id) {
@@ -32,9 +32,39 @@ function toggleFullscreen() {
   }
 }
 
+// Waits (up to `ms`) until `done()` holds; panes() is live data, so it changes while we wait.
+async function until(done, ms = 3000) {
+  for (let waited = 0; waited < ms && !done(); waited += 100) await exec("sleep", ["0.1"]);
+  return done();
+}
+
+// Join: the dragged tab's terminals become panes of the target tab, still running (same
+// process, scrollback and agent session). Each is parked (its pane goes; the source tab
+// closes with its last one) and then kept to the right of the target's focused pane.
+// Mod panes (a file viewer, a board) can't move; they stay behind in the source tab.
+async function joinTabs(source, target) {
+  const moving = panes().filter((p) => p.tab === source && p.terminal).map((p) => p.terminal);
+  if (!moving.length) return;
+  run("tab.select", { id: target });
+  for (const terminal of moving) run("terminal.park", { terminal });
+  await until(() => !panes().some((p) => moving.includes(p.terminal)));
+  for (const terminal of moving) {
+    run("tab.select", { id: target });
+    run("terminal.keep", { terminal, place: "right" });
+    await until(() => panes().some((p) => p.terminal === terminal && p.tab === target));
+  }
+  // Anything that didn't land (a remote machine that didn't answer in time) still gets a
+  // pane somewhere instead of running hidden.
+  const lost = moving.filter((t) => !panes().some((p) => p.terminal === t));
+  for (const terminal of lost) run("terminal.keep", { terminal, place: "tab" });
+  if (lost.length) notify({ title: "Join tabs", body: `${lost.length} terminal(s) opened as their own tab instead.`, level: "warning" });
+}
+
 export default class Tabs extends View {
   init(_props, cx) {
-    this.pressed = null;
+    this.pressed = null; // a pressed tab, until it's clicked or dragged: see press()
+    this.widths = {};
+    cx.timer.every(150, (cx) => this.takeJoin(cx));
     this.scroll = ScrollHandle.new();
     this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
     this.project = null;
@@ -89,6 +119,41 @@ export default class Tabs extends View {
     localStorage.setItem("panels", JSON.stringify(this.panels));
   }
 
+  // Tab dragging, like a browser's. Pressing a tab remembers where every tab is (pointer px;
+  // widths from on_size_change, the row from the pointer over it); moving 5 px opens the
+  // tab-drag mod as a transparent window over the app, which follows the pointer anywhere and
+  // reorders or asks to join on drop. A join comes back here as shared "tabs.join".
+  press(i, e, shown) {
+    const z = settings().zoom ?? 1, gap = 3 * z;
+    const W = shown.map(c => this.widths[c.id] ?? 80);
+    const left = e.position.x - (e.local_position?.x ?? 0), top = e.position.y - (e.local_position?.y ?? 0);
+    const lefts = []; lefts[i] = left;
+    for (let j = i + 1; j < shown.length; j++) lefts[j] = lefts[j - 1] + W[j - 1] + gap;
+    for (let j = i - 1; j >= 0; j--) lefts[j] = lefts[j + 1] - W[j] - gap;
+    const row = this.row && this.rowSize ? { x: this.row.x, y: this.row.y, w: this.rowSize.width, h: this.rowSize.height }
+      : { x: lefts[0], y: top - 1, w: lefts[shown.length - 1] + W[shown.length - 1] - lefts[0], h: 29 * z + 2 };
+    this.pressed = { i, start: { x: e.position.x, y: e.position.y }, grab: { x: e.position.x - left, y: e.position.y - top },
+      lefts, W, gap, z, top, h: 29 * z, row, tabs: this.faces };
+  }
+
+  dragOut(e) {
+    const d = this.pressed;
+    if (!d) return;
+    if (e && Math.abs(e.position.x - d.start.x) + Math.abs(e.position.y - d.start.y) < 5) return;
+    this.pressed = null;
+    if (e) d.start = { x: e.position.x, y: e.position.y };
+    openOverlay({ mod: "tab-drag", kind: "window", frame: "none", width: 1, height: 1, at: { x: 0, y: 0 }, props: d });
+  }
+
+  takeJoin(cx) {
+    const j = shared("tabs.join");
+    if (!j || j.seq === this.joinSeq || this.joining) return;
+    this.joinSeq = j.seq;
+    setShared("tabs.join", null);
+    this.joining = true;
+    cx.spawn(async (cx) => { try { await joinTabs(j.source, j.target); } finally { this.joining = false; cx.notify(); } });
+  }
+
   render() {
     const t = theme();
     const space = spaces().find(p => p.active);
@@ -103,20 +168,21 @@ export default class Tabs extends View {
     const stop = (_e, cx) => cx.stop_propagation();
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(label);
+    this.faces = [];
     const item = (c, i) => {
       const program = panes().find(p => p.tab === c.id && p.program?.agent)?.program ?? panes().find(p => p.tab === c.id)?.program;
       const name = c.named ? c.name : program?.name ?? "Terminal";
+      this.faces[i] = { id: c.id, name, icon: program?.icon ?? null, tint: Boolean(program?.tint), status: c.status ?? null, active: Boolean(c.active), zoomed: Boolean(c.zoomed) };
       return h_flex().id(`tab-${c.id}`).h(29).px(10).gap(7).rounded(7).items_center().flex_none().text_size(12.8)
-        // A rename or status dot on this or an earlier tab can push the active one out.
-        .when(i <= active, el => el.on_size_change((_size, cx) => { this.scroll.scroll_to_item(active); cx.notify(); }))
+        .on_size_change((size, cx) => {
+          this.widths[c.id] = size.width;
+          // A rename or status dot on this or an earlier tab can push the active one out.
+          if (i <= active) { this.scroll.scroll_to_item(active); cx.notify(); }
+        })
         .border(1).border_color(c.active ? t.border : t.chrome).bg(c.active ? t.raised : t.chrome).text_color(c.active ? t.foreground : t.muted)
         .hover(s => s.bg(t.hover))
-        .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.pressed = i; if (e.click_count === 2) run("tab.rename", { id: c.id }); })
-        .on_mouse_up("left", () => {
-          const from = this.pressed; this.pressed = null;
-          if (from !== null && from !== i) run("tab.move", { id: shown[from].id, index: space.tabs.findIndex(x => x.id === c.id) + 1 });
-          else run("tab.select", { id: c.id });
-        })
+        .on_mouse_down("left", (e, cx) => { cx.stop_propagation(); this.press(i, e, shown); if (e.click_count === 2) { this.pressed = null; run("tab.rename", { id: c.id }); } })
+        .on_mouse_up("left", () => { if (this.pressed?.i === i) { this.pressed = null; run("tab.select", { id: c.id }); } })
         .on_mouse_down("right", (_e, cx) => { cx.stop_propagation(); openOverlay({ mod: "menu", kind: "popup", width: 200, props: { tab: "tab", target: { id: c.id, space: space.id } } }); })
         .when(Boolean(program?.icon), el => el.child(program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)))
         .child(div().max_w(170).truncate().child(c.zoomed ? `${name} Z` : name))
@@ -164,10 +230,14 @@ export default class Tabs extends View {
         .on_click(() => openOverlay({ mod: "run-menu", kind: "popup", width: 320, props: { info, space: space?.id } }))
         .child(svg("mods/files/chevron-down.svg").size(12)));
     return h_flex().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
+      .on_mouse_move((e) => this.dragOut(e))
       .on_mouse_up("left", () => { this.pressed = null; })
+      // Pulled out of the bar before 5 px registered: that's a drag too.
+      .on_hover((hovered) => { if (!hovered) this.dragOut(null); })
       .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().track_scroll(this.scroll)
-        .on_size_change((_size, cx) => { if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
+        .on_size_change((size, cx) => { this.rowSize = size; if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
+        .on_mouse_move((e) => { if (e.local_position) this.row = { x: e.position.x - e.local_position.x, y: e.position.y - e.local_position.y }; })
         .children(shown.map(item)))
       .when(Boolean(c), el => el.child(runButton()).child(div().w(6).flex_none()))
       .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
