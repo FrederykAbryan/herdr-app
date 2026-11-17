@@ -17,6 +17,7 @@
 #   files     -> files-plus      Files panel: Material file/folder icons, colorful previews (.env too), Edit / Save
 #   menu      -> menu-plus       space menu with Move to group / New group, the group menu
 #
+# plus a user service, herdr-session-keeper, that resumes agents after a reboot,
 # and a layout `main-focus` (a clone of `main`) that uses them. Your own layout stays as it
 # was: switch with ctrl-shift-l. Personal mods are never overwritten by app updates.
 set -eu
@@ -104,4 +105,13 @@ walk(layout)
 json.dump(layout, open(path, "w"), indent=2)
 EOF
 herdr-app do layout.switch '{"name":"main-focus"}' >/dev/null
+
+# Session keeper: after a reboot or core restart, resume the agents (claude, codex, agy,
+# cursor-agent) that were running in each terminal. herdr-core already brings back the layout
+# and a shell per kept terminal; this types the resume command into that shell.
+if command -v systemctl >/dev/null 2>&1; then
+  install -Dm755 "$repo/scripts/session-keeper/herdr-session-keeper" "$HOME/.local/bin/herdr-session-keeper"
+  install -Dm644 "$repo/scripts/session-keeper/herdr-session-keeper.service" "$HOME/.config/systemd/user/herdr-session-keeper.service"
+  systemctl --user daemon-reload && systemctl --user enable --now herdr-session-keeper.service >/dev/null 2>&1 || true
+fi
 echo "Installed. Herdr now shows the main-focus layout; ctrl-shift-l switches layouts."

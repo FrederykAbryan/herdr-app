@@ -1,0 +1,11 @@
+[Unit]
+Description=Record agents running in Herdr terminals and resume them after a reboot or core restart
+
+[Service]
+ExecStart=%h/.local/bin/herdr-session-keeper
+Restart=always
+RestartSec=5
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target

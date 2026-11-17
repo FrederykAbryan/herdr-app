@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""Bring Herdr agent sessions back after a reboot / core restart.
+
+herdr-core already keeps the layout (docs.json) and gives every kept terminal a
+fresh shell when the core starts again. What is lost is the program that was
+running inside: Claude Code, Codex, Antigravity (agy), cursor-agent.
+
+This watcher records, every few seconds, which agent runs in each terminal and
+its session id (~/.local/state/herdr-session-keeper/agents.json). When a
+terminal's program has been restarted by herdr (new program_started_ms) and it
+now sits in a bare shell, it types the resume command into it:
+
+  claude --resume <id>        (through the user's `claude` shell function)
+  codex  resume <id>          (or `codex resume --last` when the id is unknown)
+  agy    --conversation <id>  (or `agy --continue`)
+  cursor-agent --resume <id>
+
+Quitting an agent yourself (shell still alive) forgets it, so only agents that
+were running when the machine went down come back.
+
+  --status   print what is recorded
+  --dry-run  log what would be restored, type nothing
+"""
+import json, os, re, shlex, signal, subprocess, sys, time
+
+POLL = 3.0
+FORGET_AFTER = 9.0          # agent gone this long while its shell lives = user quit it
+SETTLE_MS = 2500            # let a fresh shell read its rc files before typing
+CORE = os.path.expanduser("~/.local/state/herdr-core/default")
+STATE_DIR = os.path.expanduser("~/.local/state/herdr-session-keeper")
+STATE = os.path.join(STATE_DIR, "agents.json")
+SHELLS = {"bash", "zsh", "sh", "fish", "dash", "nu"}
+AGENTS = {"claude", "codex", "agy", "cursor-agent"}
+CLAUDE_KEEP = {"--model": 1, "--permission-mode": 1, "--add-dir": 1, "--agent": 1,
+               "--effort": 1, "--dangerously-skip-permissions": 0, "--chrome": 0,
+               "--allow-dangerously-skip-permissions": 0}
+AGY_KEEP = {"--model": 1, "--mode": 1, "--agent": 1, "--effort": 1, "--add-dir": 1,
+            "--project": 1, "--dangerously-skip-permissions": 0, "--sandbox": 0}
+CODEX_KEEP = {"-m": 1, "--model": 1, "-c": 1, "--config": 1, "-p": 1, "--profile": 1,
+              "-s": 1, "--sandbox": 1, "-a": 1, "--ask-for-approval": 1, "--enable": 1,
+              "--disable": 1, "--no-daemon": 0, "--full-auto": 0, "--search": 0,
+              "--dangerously-bypass-approvals-and-sandbox": 0}
+DRY = "--dry-run" in sys.argv
+stopping = False
+
+
+def log(*a):
+    print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+
+def load(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def save(state):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=1)
+    os.replace(tmp, STATE)
+
+
+def system_stopping():
+    try:
+        r = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True, timeout=3)
+        return r.stdout.strip() == "stopping"
+    except Exception:
+        return False
+
+
+# ---------- processes ----------
+
+def proc_info(pid):
+    try:
+        stat = open(f"/proc/{pid}/stat").read()
+        rest = stat[stat.rindex(")") + 2:].split()
+        argv = open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").split("\0")[:-1]
+        comm = stat[stat.index("(") + 1:stat.rindex(")")]
+        return {"pid": int(pid), "ppid": int(rest[1]), "start": rest[19], "comm": comm, "argv": argv}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def env_of(pid):
+    try:
+        raw = open(f"/proc/{pid}/environ", "rb").read().decode(errors="replace")
+        return dict(e.split("=", 1) for e in raw.split("\0") if "=" in e)
+    except OSError:
+        return {}
+
+
+def agent_kind(p):
+    names = {p["comm"]}
+    if p["argv"]:
+        names.add(os.path.basename(p["argv"][0]))
+    kind = next((n for n in names if n in AGENTS), None)
+    if kind == "codex" and len(p["argv"]) > 1 and p["argv"][1] in ("app-server", "exec", "mcp", "mcp-server"):
+        return None
+    if kind == "claude" and any(a in ("-p", "--print") for a in p["argv"][1:]):
+        return None   # headless helper (e.g. commit-message generator), not a session
+    return kind
+
+
+def scan_agents(terms):
+    """terminal address -> agent proc (outermost agent whose ancestors lead to the terminal's shell)."""
+    procs = {}
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        p = proc_info(pid)
+        if p:
+            procs[p["pid"]] = p
+    shell_pid = {a: t.get("pid") for a, t in terms.items() if t.get("state") == "live" and t.get("pid")}
+    out = {}
+    for p in procs.values():
+        kind = agent_kind(p)
+        if not kind:
+            continue
+        t = env_of(p["pid"]).get("HC_TERMINAL_ID")
+        if not t or t not in shell_pid:
+            continue
+        # walk up: must reach the terminal's program without passing another agent
+        cur, ok = procs.get(p["ppid"]), False
+        while cur:
+            if cur["pid"] == shell_pid[t]:
+                ok = True
+                break
+            if agent_kind(cur):
+                break
+            cur = procs.get(cur["ppid"])
+        if not ok:
+            continue   # orphan or nested agent
+        if t not in out or int(p["start"]) < int(out[t]["start"]):
+            p["kind"] = kind
+            try:
+                p["cwd"] = os.readlink(f"/proc/{p['pid']}/cwd")
+            except OSError:
+                p["cwd"] = None
+            out[t] = p
+    return out
+
+
+def fd_targets(pid):
+    out = []
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                out.append(os.readlink(f"/proc/{pid}/fd/{fd}"))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return out
+
+
+UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_rollout_cwd = {}
+
+
+def rollout_meta(path):
+    if path not in _rollout_cwd:
+        try:
+            with open(path) as f:
+                m = json.loads(f.readline()).get("payload", {})
+            _rollout_cwd[path] = (m.get("id") or m.get("session_id"), m.get("cwd"))
+        except (OSError, ValueError):
+            return None, None
+    return _rollout_cwd[path]
+
+
+def codex_rollouts(pids):
+    """Rollout files currently open by any codex process (TUI or app-server daemon)."""
+    files = set()
+    for pid in pids:
+        for t in fd_targets(pid):
+            if os.path.basename(t).startswith("rollout-") and t.endswith(".jsonl"):
+                files.add(t)
+    return files
+
+
+def recent_rollouts(since_s):
+    root = os.path.expanduser("~/.codex/sessions")
+    out = []
+    for day in sorted({time.strftime("%Y/%m/%d", time.localtime(t)) for t in (since_s, time.time())}):
+        d = os.path.join(root, day)
+        try:
+            for n in os.listdir(d):
+                if n.startswith("rollout-") and n.endswith(".jsonl"):
+                    out.append(os.path.join(d, n))
+        except OSError:
+            pass
+    return out
+
+
+def session_id(p, boot_s, codex_open):
+    kind, pid = p["kind"], p["pid"]
+    if kind == "claude":
+        for _ in range(3):
+            s = load(os.path.expanduser(f"~/.claude/sessions/{pid}.json"), None)
+            if s and str(s.get("procStart")) == p["start"]:
+                return s.get("sessionId")
+            if s is None:
+                time.sleep(0.05)
+        return None
+    if kind == "codex":
+        mine = [t for t in fd_targets(pid) if os.path.basename(t).startswith("rollout-")]
+        if mine:
+            return rollout_meta(mine[0])[0]
+        # daemon mode: rollout lives in the app-server; match by cwd, newest first
+        started = boot_s + int(p["start"]) / os.sysconf("SC_CLK_TCK")
+        cands = [f for f in codex_open | set(recent_rollouts(started)) if os.path.exists(f)]
+        cands = [f for f in cands if rollout_meta(f)[1] == p.get("cwd") and os.path.getmtime(f) >= started]
+        cands.sort(key=os.path.getmtime, reverse=True)
+        return rollout_meta(cands[0])[0] if cands else None
+    if kind == "agy":
+        for t in fd_targets(pid):
+            if "/presence/" in t or "/conversations/" in t:
+                m = UUID.search(os.path.basename(t))
+                if m:
+                    return m.group(0)
+        return None
+    if kind == "cursor-agent":
+        for t in fd_targets(pid):
+            if "/chats/" in t:
+                m = UUID.search(t)
+                if m:
+                    return m.group(0)
+        return None
+    return None
+
+
+def keep_flags(argv, allow):
+    out, i = [], 1
+    while i < len(argv):
+        a = argv[i]
+        key = a.split("=", 1)[0]
+        if key in allow:
+            if allow[key] and "=" not in a and i + 1 < len(argv):
+                out += [a, argv[i + 1]]
+                i += 2
+                continue
+            out.append(a)
+        i += 1
+    return out
+
+
+def resume_cmd(e):
+    kind, sid, argv = e["kind"], e.get("session"), e.get("argv", [])
+    if kind == "claude":
+        cmd = ["claude"] + keep_flags(argv, CLAUDE_KEEP) + (["--resume", sid] if sid else ["--continue"])
+    elif kind == "codex":
+        cmd = ["codex"] + keep_flags(argv, CODEX_KEEP) + ["resume"] + ([sid] if sid else ["--last"])
+    elif kind == "agy":
+        cmd = ["agy"] + keep_flags(argv, AGY_KEEP) + (["--conversation", sid] if sid else ["--continue"])
+    else:
+        cmd = ["cursor-agent"] + (["--resume", sid] if sid else ["resume"])
+    line = " ".join(shlex.quote(c) for c in cmd)
+    if e.get("cwd"):
+        line = f"cd {shlex.quote(e['cwd'])} && {line}"
+    return line
+
+
+# ---------- main loop ----------
+
+def boot_seconds():
+    for line in open("/proc/stat"):
+        if line.startswith("btime"):
+            return int(line.split()[1])
+    return 0
+
+
+def layout_terminals():
+    doc = load(os.path.join(CORE, "docs.json"), None)
+    if doc is None:
+        return None
+    return set(re.findall(r'"terminal":\s*"([^"]+)"', json.dumps(doc)))
+
+
+def tick(state, boot_s):
+    terms = {t["address"]: t for t in load(os.path.join(CORE, "terminals.json"), {}).get("terminals", {}).values()}
+    if not terms:
+        return False
+    in_layout = layout_terminals()
+    agents = scan_agents(terms)
+    codex_pids = [p["pid"] for p in agents.values() if p["kind"] == "codex"]
+    codex_pids += [int(x) for x in filter(str.isdigit, os.listdir("/proc"))
+                   if (proc_info(x) or {}).get("argv", [""])[1:2] == ["app-server"]]
+    codex_open = codex_rollouts(codex_pids)
+    now_ms = int(time.time() * 1000)
+    changed = False
+
+    # 1. record running agents
+    for addr, p in agents.items():
+        t = terms[addr]
+        sid = session_id(p, boot_s, codex_open)
+        old = state.get(addr, {})
+        e = {"kind": p["kind"], "session": sid or (old.get("session") if old.get("pid") == p["pid"] else None),
+             "argv": p["argv"], "cwd": p.get("cwd"), "pid": p["pid"], "start": p["start"],
+             "term_started": t.get("program_started_ms"), "shell_pid": t.get("pid"),
+             "where": t.get("labels", {}).get("where"), "seen": now_ms}
+        if {k: v for k, v in e.items() if k != "seen"} != {k: v for k, v in old.items() if k not in ("seen", "missing")}:
+            if old.get("session") != e["session"] or old.get("kind") != e["kind"]:
+                log(f"{addr}: {e['kind']} {e['session'] or '(no id yet)'} in {e['cwd']}")
+            changed = True
+        elif now_ms - old.get("seen", 0) > 60000:
+            changed = True
+        state[addr] = e
+
+    # 2. forget / restore the rest
+    for addr in list(state):
+        if addr in agents:
+            continue
+        e, t = state[addr], terms.get(addr)
+        if in_layout is not None and addr not in in_layout and (t is None or t.get("state") != "live"):
+            log(f"{addr}: terminal closed, forgetting {e['kind']}")
+            del state[addr]
+            changed = True
+            continue
+        if not t or t.get("state") != "live":
+            continue  # core down / terminal parked: keep it for later
+        fg = (t.get("foreground") or {}).get("name") or ""
+        restarted = (t.get("program_started_ms") or 0) > (e.get("term_started") or 0)
+        if not restarted:
+            # same shell as when the agent ran: did the user quit the agent?
+            if t.get("pid") == e.get("shell_pid") and os.path.exists(f"/proc/{t.get('pid')}") and fg in SHELLS:
+                e.setdefault("missing", now_ms)
+                if now_ms - e["missing"] >= FORGET_AFTER * 1000 and not stopping and not system_stopping():
+                    log(f"{addr}: {e['kind']} exited, forgetting")
+                    del state[addr]
+                    changed = True
+            continue
+        if fg not in SHELLS or now_ms - (t.get("program_started_ms") or now_ms) < SETTLE_MS:
+            continue
+        if e.get("restored") == t.get("program_started_ms"):
+            continue  # already typed into this shell; give it time to show up
+        line = resume_cmd(e)
+        log(f"{addr} ({e.get('where')}): restoring -> {line}")
+        if not DRY:
+            r = subprocess.run(["herdr-core", "send", addr, line], capture_output=True, text=True, timeout=20)
+            if r.returncode != 0:
+                log(f"{addr}: send failed: {r.stderr.strip() or r.stdout.strip()}")
+                continue
+        e["restored"] = t.get("program_started_ms")
+        changed = True
+    return changed
+
+
+def main():
+    global stopping
+    if "--status" in sys.argv:
+        for addr, e in sorted(load(STATE, {}).items()):
+            print(f"{addr:5} {e.get('where') or '':40} {resume_cmd(e)}")
+        return
+
+    def on_term(*_):
+        global stopping
+        stopping = True
+    signal.signal(signal.SIGTERM, on_term)
+    state = load(STATE, {})
+    boot_s = boot_seconds()
+    log(f"watching; {len(state)} recorded agent(s)" + (" [dry run]" if DRY else ""))
+    while not stopping:
+        try:
+            if tick(state, boot_s) and not stopping and not DRY:
+                save(state)
+        except Exception as ex:  # never die on a bad read
+            log("tick failed:", repr(ex))
+        time.sleep(POLL)
+
+
+if __name__ == "__main__":
+    main()
