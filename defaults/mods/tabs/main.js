@@ -60,13 +60,31 @@ async function joinTabs(source, target) {
   if (lost.length) notify({ title: "Join tabs", body: `${lost.length} terminal(s) opened as their own tab instead.`, level: "warning" });
 }
 
+// Same as the agents mod: drops a status glyph, keeps a leading bracket or quote.
+const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}\p{Ps}\p{Pi}]+/u, "").replace(/^\[ [!.] \] /, "").trim();
+
+// A tab Herdr named (unnamed, or after its program) follows its agent's live
+// title, as the agents list does; a name the person gave stays.
+function label(tab, lead) {
+  const prog = lead?.program?.name;
+  const base = tab.named ? tab.name : prog ?? "Terminal";
+  if (!lead?.program?.agent) return base;
+  const live = clean(lead.title);
+  // clean() would strip a path's leading ~ or /: test the title with only its status glyph gone.
+  const path = /^[~/]|^[A-Za-z]:\\/.test((lead.title ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
+  const telling = live && live !== lead.terminal && live !== prog && !path && !live.includes("@") && live.toLowerCase() !== lead.program.key;
+  return (tab.name === prog || !tab.named) && telling ? live : base;
+}
+
 export default class Tabs extends View {
   init(_props, cx) {
     this.pressed = null; // a pressed tab, until it's clicked or dragged: see press()
     this.widths = {};
     cx.timer.every(150, (cx) => this.takeJoin(cx));
     this.scroll = ScrollHandle.new();
-    this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}");
+    try { this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}"); } catch { this.panels = {}; }
+    if (!this.panels || typeof this.panels !== "object" || Array.isArray(this.panels)) this.panels = {};
+    this.swipe = { acc: 0, steps: 0, at: 0, last: 0 };
     this.project = null;
     this.detect(cx);
     cx.timer.every(2500, (cx) => this.detect(cx));
@@ -88,6 +106,30 @@ export default class Tabs extends View {
         this.projectKey = key; this.looked = Date.now();
       } catch {} finally { this.looking = false; }
     });
+  }
+
+
+  // One tab per wheel notch. A touchpad or smooth-scrolling mouse sends many
+  // small events per gesture: a short swipe or one smoothed notch (about
+  // 25 px) switches one tab, a longer swipe keeps going a tab per 60 px, at
+  // most one every 100 ms so each shows.
+  wheel(e) {
+    if (e.delta_lines) {
+      if (e.delta_lines.y) run(e.delta_lines.y > 0 ? "tab.prev" : "tab.next");
+      return;
+    }
+    const s = this.swipe, now = Date.now();
+    // Phases often arrive only as moves (a macOS touchpad included): a pause
+    // or a turn starts a new gesture.
+    if (e.touch_phase === "started" || now - s.at > 250 || e.delta.y * s.acc < 0) Object.assign(s, { acc: 0, steps: 0 });
+    s.at = now;
+    s.acc += e.delta.y;
+    const need = s.steps ? 60 : 20;
+    if (Math.abs(s.acc) < need || now - s.last < 100) return;
+    s.acc -= Math.sign(s.acc) * need;
+    s.steps++;
+    s.last = now;
+    run(e.delta.y > 0 ? "tab.prev" : "tab.next");
   }
 
   // The side panel is remembered per space: switching shows that space's choice
@@ -170,8 +212,9 @@ export default class Tabs extends View {
       .on_mouse_down("left", stop).on_click(action).child(label);
     this.faces = [];
     const item = (c, i) => {
-      const program = panes().find(p => p.tab === c.id && p.program?.agent)?.program ?? panes().find(p => p.tab === c.id)?.program;
-      const name = c.named ? c.name : program?.name ?? "Terminal";
+      const lead = panes().find(p => p.tab === c.id && p.program?.agent) ?? panes().find(p => p.tab === c.id);
+      const program = lead?.program;
+      const name = label(c, lead);
       this.faces[i] = { id: c.id, name, icon: program?.icon ?? null, tint: Boolean(program?.tint), status: c.status ?? null, active: Boolean(c.active), zoomed: Boolean(c.zoomed) };
       return h_flex().id(`tab-${c.id}`).h(29).px(10).gap(7).rounded(7).items_center().flex_none().text_size(12.8)
         .on_size_change((size, cx) => {
@@ -234,7 +277,7 @@ export default class Tabs extends View {
       .on_mouse_up("left", () => { this.pressed = null; })
       // Pulled out of the bar before 5 px registered: that's a drag too.
       .on_hover((hovered) => { if (!hovered) this.dragOut(null); })
-      .on_scroll_wheel(e => { if (Math.abs(e.delta.y) >= 1) run(e.delta.y > 0 ? "tab.prev" : "tab.next"); })
+      .on_scroll_wheel(e => this.wheel(e))
       .child(h_flex().id("tab-scroll").flex_1().min_w(0).h_full().items_center().gap(3).overflow_x_scrollbar().track_scroll(this.scroll)
         .on_size_change((size, cx) => { this.rowSize = size; if (active >= 0) { this.scroll.scroll_to_item(active); cx.notify(); } })
         .on_mouse_move((e) => { if (e.local_position) this.row = { x: e.position.x - e.local_position.x, y: e.position.y - e.local_position.y }; })
