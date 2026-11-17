@@ -1154,6 +1154,16 @@ export default class Changes extends View {
         .loop("left", { from: -bar, to: w, period: 1400 }));
   }
 
+  // Right-click on a file or folder: reveal it, open it, copy its path (mods/file-menu).
+  fileMenu(el, g, rel, dir = false) {
+    const root = g.repo?.root;
+    if (!root) return el;
+    return el.on_mouse_down("right", (_e, cx) => {
+      cx.stop_propagation();
+      openOverlay({ mod: "file-menu", kind: "popup", at: "pointer", width: 240, height: 220, props: { path: `${root}/${rel}`, root, on: g.repo.on ?? null, dir } });
+    });
+  }
+
   // Rows show their buttons while the pointer is on them, as editors do.
   hoverable(el, id) {
     return el.on_hover((hovered, cx) => {
@@ -1223,7 +1233,7 @@ export default class Changes extends View {
   dirRow(g, { dir, name, depth, paths }, t) {
     const id = `dir-${g.id}|${dir}`, key = `${g.id}:${dir}`, open = !this.collapsed.has(key);
     const action = this.hovered === id ? this.rowAction(g, id, paths, t, `${paths.length} file${paths.length === 1 ? "" : "s"} in ${dir}`) : null;
-    return this.hoverable(h_flex().id(id).h(24).flex_none().pl(20 + (this.nest ?? 0) + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
+    return this.hoverable(this.fileMenu(h_flex().id(id), g, dir, true).h(24).flex_none().pl(20 + (this.nest ?? 0) + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer().hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => this.toggle(this.collapsed, key, cx))
       .child(icon(open ? "chevron-down" : "chevron-right", 16).text_color(t.muted))
       .child(folderIcon(FT, open, name))
@@ -1239,7 +1249,7 @@ export default class Changes extends View {
       .text_color(t.muted).hover((s) => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.compare(key, cx))
       .child(svg("mods/diff-view/split.svg").size(16)) : null;
-    return this.hoverable(h_flex().id(key).h(24).flex_none().pl(20 + (this.nest ?? 0) + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer()
+    return this.hoverable(this.fileMenu(h_flex().id(key), g, f.path).h(24).flex_none().pl(20 + (this.nest ?? 0) + depth * 14).pr(4).gap(6).items_center().rounded(5).cursor_pointer()
       .when(this.open === key, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((e, cx) => { if (e.click_count === 2) this.compare(key, cx); else this.pick(key, cx); })
       // In the tree a file lines up under its folder's icon, past the chevron column.
       .when(this.tree, (e) => e.child(div().w(16).flex_none()))

@@ -2,7 +2,7 @@
 // preview turns into an editor with Edit: ctrl+s saves, refusing if the file changed on disk.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, layout, run, shared, setShared } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, writeTextFile, watchFolder, theme, settings, window, layout, run, shared, setShared, openOverlay } from "herdr";
 import { typeIcon, folderIcon } from "./filetypes.js";
 
 const FT = "mods/files";
@@ -328,6 +328,12 @@ export default class Files extends View {
       const path = prefix ? `${prefix}/${entry.name}` : entry.name, open = this.folders.has(path), mark = this.marks[`${this.root}/${path}`];
       out.push(h_flex().id(`file-${path}`).h(28).flex_none().pl(8 + depth * 18).pr(8).gap(7).items_center().rounded(7).cursor_pointer().hover(s => s.bg(t.hover))
         .when(!entry.dir && path === this.file, el => el.bg(t.selected))
+        // Right-click: reveal it, open it, copy its path (mods/file-menu).
+        .on_mouse_down("right", (_e, cx) => {
+          cx.stop_propagation();
+          openOverlay({ mod: "file-menu", kind: "popup", at: "pointer", width: 240, height: 220,
+            props: { path: `${this.root}/${path}`, root: this.root, on: this.on ?? null, dir: Boolean(entry.dir) } });
+        })
         .on_click((_e, cx) => {
           if (entry.dir) return this.toggle(path, cx);
           if (path === this.file) return;

@@ -8,6 +8,7 @@
 #   pane      -> pane-plus       pane header: an agent's conversation title next to its name
 #   pane-grid -> pane-grid       the grid menu (new)
 #   tab-drag  -> tab-drag        a dragged tab: follows the pointer, reorders or joins tabs (new)
+#   file-menu -> file-menu       right-click on a file in Files/Changes: reveal, open, terminal, copy path (new)
 #   run-menu  -> run-menu        the Run button's script list (new)
 #   diff-view -> diff-view       side-by-side compare, opened from the Changes panel (new)
 #   git-graph -> git-graph       commit graph, opened from the Changes panel (new)
@@ -52,6 +53,8 @@ cp "$src"/run-menu/* "$home/mods/run-menu/"
 
 mkdir -p "$home/mods/tab-drag"
 cp "$src"/tab-drag/* "$home/mods/tab-drag/"
+mkdir -p "$home/mods/file-menu"
+cp "$src"/file-menu/* "$home/mods/file-menu/"
 
 mkdir -p "$home/mods/pane-grid"
 cp "$src/pane-grid/main.js" "$src/pane-grid/mod.json" "$home/mods/pane-grid/"
@@ -77,7 +80,7 @@ cp -r "$src/files/mi" "$home/mods/files-plus/"
 clone menu menu-plus
 sed 's|^const SELF = "menu";|const SELF = "menu-plus";|' "$src/menu/main.js" > "$home/mods/menu-plus/main.js"
 
-for m in spaces-plus menu-plus files-plus changes-focus agents-view tabs-plus tab-drag pane-plus pane-grid run-menu diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
+for m in spaces-plus menu-plus files-plus changes-focus agents-view tabs-plus tab-drag file-menu pane-plus pane-grid run-menu diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
 
 # The layout: clone main once, then point its blocks at the personal mods.
 [ -f "$home/layouts/main-focus.json" ] || herdr-app do layout.clone '{"name":"main","as":"main-focus"}' >/dev/null
