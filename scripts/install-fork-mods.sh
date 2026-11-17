@@ -5,6 +5,7 @@
 #   changes   -> changes-focus   Changes panel: session focus, staging, tree, generate, diffs
 #   agents    -> agents-view     Agents sidebar: group / sort / hide idle
 #   tabs      -> tabs-plus       Tab bar: grid layouts, full screen, Run button (package.json scripts)
+#   pane      -> pane-plus       pane header: an agent's conversation title next to its name
 #   pane-grid -> pane-grid       the grid menu (new)
 #   tab-drag  -> tab-drag        a dragged tab: follows the pointer, reorders or joins tabs (new)
 #   run-menu  -> run-menu        the Run button's script list (new)
@@ -43,6 +44,9 @@ clone tabs tabs-plus
 sed 's|mods/tabs/|mods/tabs-plus/|g' "$src/tabs/main.js" > "$home/mods/tabs-plus/main.js"
 cp "$src"/tabs/scm-*.svg "$src"/tabs/run-*.svg "$src/tabs/run.js" "$src/tabs/CODICONS-LICENSE" "$home/mods/tabs-plus/"
 
+clone pane pane-plus
+sed 's|mods/pane/|mods/pane-plus/|g' "$src/pane/main.js" > "$home/mods/pane-plus/main.js"
+
 mkdir -p "$home/mods/run-menu"
 cp "$src"/run-menu/* "$home/mods/run-menu/"
 
@@ -73,14 +77,14 @@ cp -r "$src/files/mi" "$home/mods/files-plus/"
 clone menu menu-plus
 sed 's|^const SELF = "menu";|const SELF = "menu-plus";|' "$src/menu/main.js" > "$home/mods/menu-plus/main.js"
 
-for m in spaces-plus menu-plus files-plus changes-focus agents-view tabs-plus tab-drag pane-grid run-menu diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
+for m in spaces-plus menu-plus files-plus changes-focus agents-view tabs-plus tab-drag pane-plus pane-grid run-menu diff-view git-graph workspace-status-plus; do herdr-app check "$home/mods/$m"; done
 
 # The layout: clone main once, then point its blocks at the personal mods.
 [ -f "$home/layouts/main-focus.json" ] || herdr-app do layout.clone '{"name":"main","as":"main-focus"}' >/dev/null
 python3 -I - "$home/layouts/main-focus.json" <<'EOF'
 import json, sys
 path = sys.argv[1]
-swap = {"changes": "changes-focus", "agents": "agents-view", "tabs": "tabs-plus", "workspace-status": "workspace-status-plus", "spaces": "spaces-plus", "files": "files-plus"}
+swap = {"changes": "changes-focus", "agents": "agents-view", "tabs": "tabs-plus", "pane": "pane-plus", "workspace-status": "workspace-status-plus", "spaces": "spaces-plus", "files": "files-plus"}
 layout = json.load(open(path))
 def walk(node):
     if isinstance(node, dict):

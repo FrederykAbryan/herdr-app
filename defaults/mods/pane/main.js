@@ -29,6 +29,20 @@ function icon(p, size, color) {
   return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
 }
 
+// What an agent is working on: the title it gives its terminal (Claude Code sets the
+// conversation's topic), minus the status glyph or spinner in front ("✳ Fix login",
+// "⠋ - Thinking") and Codex's "[ ! ] " mark, as the Agents list does. Nothing when the title
+// only repeats the program, a folder or user@host.
+const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}\p{Ps}\p{Pi}]+/u, "").replace(/^\[ [!.] \] /, "").trim();
+function session(p) {
+  if (!p.program?.agent) return "";
+  const live = clean(p.title);
+  const path = /^[~/]|^[A-Za-z]:\\/.test((p.title ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
+  const name = p.program?.name ?? "";
+  if (!live || path || live.includes("@") || live === name || live.toLowerCase() === p.program?.key?.toLowerCase()) return "";
+  return live;
+}
+
 function folder(cwd) {
   if (!cwd) return "";
   const h = home();
@@ -62,6 +76,7 @@ export default class Pane extends View {
     if (!p) return div();
     const name = ((p.program?.agent || p.program?.shell) && p.program.name) || p.title || p.program?.name || "shell";
     const pic = icon(p.program, 14, t.dim);
+    const topic = session(p);
     const st = p.status;
     const pane = p.pane;
     const bottom = paneFrame(layout())?.header?.position === "bottom";
@@ -80,7 +95,11 @@ export default class Pane extends View {
       .on_click(() => run("pane.focus", { pane }))
       .when(Boolean(pic), (el) => el.child(pic))
       .child(div().flex_none().truncate().max_w(260).font_medium().text_color(t.foreground).child(name))
-      .child(div().flex_1().truncate().text_color(t.dim).child(folder(p.cwd)))
+      .when(Boolean(topic), el => el
+        .child(div().flex_none().text_color(t.dim).child("›"))
+        .child(div().id(`pane-topic-${pane}`).flex_initial().min_w(0).truncate().text_color(t.foreground).tooltip(topic).child(topic)))
+      .child(div().when(Boolean(topic), d => d.flex_initial().max_w(320)).when(!topic, d => d.flex_1()).min_w(0).truncate().text_color(t.dim).child(folder(p.cwd)))
+      .when(Boolean(topic), el => el.child(div().flex_1()))
       .when(st === "working", el => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
       .when(st === "blocked", el => el.child(div().flex_none().px(6).h(18).flex().items_center().rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).child("Needs you")))
       .when(st === "done", el => el.child(div().size(7).flex_none().rounded(4).bg(t.done)))
