@@ -454,11 +454,15 @@ export default class Changes extends View {
 
   // The agent whose changes Session mode shows: the focused terminal's. A plain terminal has
   // none of its own and doesn't borrow a neighbour's; only when no terminal has the focus
-  // (a mod pane) does the tab's most recent agent stand in.
+  // (a mod pane) does the tab's most recent agent stand in. `focused().agent` is the app-wide
+  // "current agent" (the last one picked in the agents list or with agent.next), wherever it
+  // is: it counts only when it's in this tab, or a plain shell in another space shows its repos.
   session() {
     const f = focused(), saved = shared(SESSIONS) ?? {};
-    const tab = f?.terminal ? [] : agents().filter((a) => a.tab === f?.tab).sort((a, b) => b.seq - a.seq).map((a) => a.address);
-    for (const address of [f?.terminal, f?.agent, ...tab]) if (address && saved[address]) return { address, ...saved[address] };
+    const inTab = agents().filter((a) => a.tab === f?.tab);
+    const tab = f?.terminal ? [] : inTab.sort((a, b) => b.seq - a.seq).map((a) => a.address);
+    const agent = !f?.terminal && inTab.some((a) => a.address === f?.agent) ? f.agent : null;
+    for (const address of [f?.terminal, agent, ...tab]) if (address && saved[address]) return { address, ...saved[address] };
     return null;
   }
 
