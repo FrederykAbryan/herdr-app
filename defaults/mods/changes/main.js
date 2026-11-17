@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, agents, terminals, machines, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay, home } from "herdr";
+import { spaces, panes, focused, agents, terminals, machines, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay, home, run, pickFolder } from "herdr";
 import { typeIcon, folderIcon } from "./filetypes.js";
 
 function location() {
@@ -402,6 +402,20 @@ const CONTROL = new Set(`if else for while do switch case default break continue
   in of instanceof typeof match loop when elif except raise pass with then fi esac done`.split(/\s+/));
 const LITERAL = new Set("true false null undefined this self Self super None True False nil none".split(" "));
 
+// The ⋯ menu (mods/git-menu) asks, then hands the work here as { owner, seq, kind, ... }:
+// a popup's own tasks end when it closes.
+const GITOP = "changes.gitop";
+// Network git never waits for a password nobody can type.
+const QUIET = ["GIT_TERMINAL_PROMPT=0", "GIT_MERGE_AUTOEDIT=no", "GIT_EDITOR=true"];
+const STATUS_ORDER = { C: 0, U: 1, A: 2, M: 3, D: 4 };
+const SORTS = {
+  name: (a, b) => a.path.split("/").pop().localeCompare(b.path.split("/").pop()) || a.path.localeCompare(b.path),
+  path: (a, b) => a.path.localeCompare(b.path),
+  status: (a, b) => (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9) || a.path.localeCompare(b.path),
+};
+// What git said last, for a short note: its last few lines.
+const tail = (text, n = 3) => text.trim().split("\n").map((l) => l.trim()).filter(Boolean).slice(-n).join(" · ");
+
 const GROUP_TITLE = { staged: "Staged Changes", outside: "Staged outside this session", changes: "Changes", committed: "Committed by this session" };
 
 export default class Changes extends View {
@@ -416,6 +430,9 @@ export default class Changes extends View {
     // The file list's height when dragged (the line above the diff); null: as tall as its rows.
     try { const h = Number(localStorage.getItem("listHeight")); this.listH = h > 0 ? h : null; } catch { this.listH = null; }
     this.panelH = 800; this.listMeasured = 200; this.genSeq = 0; this.msgW = 0;
+    // The ⋯ menu's work for this copy only, and none left over from before it started.
+    this.uid = `${Date.now()}-${Math.random()}`; this.opSeq = shared(GITOP)?.seq ?? null; this.doneSeq = 0;
+    try { this.sort = SORTS[localStorage.getItem("sort")] ? localStorage.getItem("sort") : "path"; } catch { this.sort = "path"; }
     this.input = InputState.new({ placeholder: "Message (Enter to commit)" });
     this.input.on("change", (_e, cx) => {
       const hadMessage = Boolean(this.message.trim());
@@ -1070,23 +1087,35 @@ export default class Changes extends View {
 
   // Commits what's staged, like `git commit`. In Session mode the session's committed files
   // then leave its list.
-  commit(cx) {
+  // From the ⋯ menu also: all (stage this list's Changes first), smart (all when nothing is
+  // staged), amend (an empty message keeps the last one), signoff.
+  commit(cx, opts = {}) {
     const repo = this.repo();
-    if (!this.message.trim() || !repo || this.busy || this.loading || this.generating || this.context !== this.key()) return;
+    const amend = Boolean(opts.amend);
+    if (!repo || this.busy || this.loading || this.generating || this.context !== this.key()) return;
+    if (!this.message.trim() && !amend) { if (opts.menu) { this.note = "Type a commit message first"; cx.notify(); } return; }
     const staged = this.group("staged", repo), outside = this.group("outside", repo);
-    if (!staged.length && !outside.length) { this.note = "Nothing is staged: stage files with + first"; cx.notify(); return; }
+    const all = Boolean(opts.all || (opts.smart && !staged.length && !outside.length));
+    const extra = all ? this.group("changes", repo).filter((f) => f.status !== "C") : [];
+    if (!staged.length && !outside.length && !extra.length && !amend) { this.note = all ? "No changes to commit" : "Nothing is staged: stage files with + first"; cx.notify(); return; }
     const reverted = [...staged, ...outside].filter((f) => f.reverted).map((f) => f.path);
     if (reverted.length) {
       this.note = `Reverted but still staged: ${reverted.slice(0, 3).join(", ")}${reverted.length > 3 ? ` +${reverted.length - 3}` : ""}. Unstage (−) to drop the change, or stage (+) again to commit it.`;
       cx.notify(); return;
     }
     const root = repo.root, on = repo.on, context = this.context, message = this.message.trim();
-    const session = repo.trees ? repo.session : null, paths = staged.map((f) => f.path);
-    this.busy = true; this.note = null;
+    const session = repo.trees ? repo.session : null, paths = [...staged, ...extra].map((f) => f.path);
+    this.busy = true; this.note = null; this.opLabel = amend ? "Amending" : "Committing";
     cx.spawn(async (cx) => {
       try {
-        const r = await exec("git", ["commit", "-m", message], { cwd: root, on });
+        if (extra.length) {
+          const a = await exec("git", ["--literal-pathspecs", "add", "-A", "--", ...extra.map((f) => f.path)], { cwd: root, on });
+          if (a.code !== 0) throw new Error((a.stderr || a.stdout).trim());
+        }
+        const args = ["commit", ...(message ? ["-m", message] : ["--no-edit"]), ...(amend ? ["--amend"] : []), ...(opts.signoff ? ["--signoff"] : [])];
+        const r = await exec("env", [...QUIET, "git", ...args], { cwd: root, on });
         if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+        if (opts.menu) this.done(tail(r.stdout, 1), cx);
         this.message = ""; this.input.set_value("");
         if (session && paths.length) {
           const tree = await this.advance(root, on, repo.trees.base, paths);
@@ -1094,7 +1123,84 @@ export default class Changes extends View {
           this.saveSession(session.address, withRoot(now, root, { tree }));
         }
       } catch (e) { if (this.key() === context) this.note = `Commit failed: ${e?.message ?? e}`; }
-      finally { this.busy = false; this.refresh(cx); cx.notify(); }
+      finally { this.busy = false; this.opLabel = null; this.refresh(cx); cx.notify(); }
+    });
+    cx.notify();
+  }
+
+  // A short green line under the buttons for what the ⋯ menu did; it goes after a while.
+  done(text, cx) {
+    const seq = ++this.doneSeq;
+    this.doneNote = text || "Done";
+    cx.timer.after(6000, (cx) => { if (seq === this.doneSeq) { this.doneNote = null; cx.notify(); } });
+  }
+
+  // The ⋯ menu's work (mods/git-menu): git commands, or what the panel's own buttons do.
+  menuOp(op, cx) {
+    if (op.kind === "view") { if (this.tree !== op.tree) this.toggleTree(cx); return; }
+    if (op.kind === "sort") { this.sort = op.sort; try { localStorage.setItem("sort", op.sort); } catch {} if (this.tree) this.toggleTree(cx); cx.notify(); return; }
+    if (op.kind === "mode") { this.setMode(op.mode, cx); return; }
+    if (op.kind === "preview") { this.setPreview(op.on, cx); return; }
+    // The rest act on the repo the menu was opened for.
+    const repo = this.repos.find((r) => r.root === op.root) ?? this.repo();
+    if (repo && repo.root !== this.root) this.setActive(repo.root, cx);
+    if (op.kind === "commit") { this.commit(cx, { ...op, menu: true }); return; }
+    if (op.kind === "stage-all" || op.kind === "discard-all") {
+      const items = this.group("changes", repo).filter((f) => (op.tracked ? !f.fresh : op.untracked ? f.fresh : true));
+      if (!items.length) { this.note = "No changes"; cx.notify(); return; }
+      const paths = items.map((f) => f.path);
+      if (op.kind === "stage-all") this.stage(repo, paths, cx);
+      else this.discard(repo, paths, op.tracked ? "all tracked files" : op.untracked ? "all untracked files" : `all ${paths.length} file${paths.length === 1 ? "" : "s"}`, cx);
+      return;
+    }
+    if (op.kind === "unstage-all") {
+      const paths = [...this.group("staged", repo), ...this.group("outside", repo)].map((f) => f.path);
+      if (!paths.length) { this.note = "Nothing is staged"; cx.notify(); return; }
+      this.unstage(repo, paths, cx);
+      return;
+    }
+    const root = op.root ?? repo?.root, on = op.on ?? repo?.on ?? null;
+    if (!root || this.busy) { if (this.busy) { this.note = "Busy: try again in a moment"; cx.notify(); } return; }
+    const label = op.label ?? "Git";
+    this.busy = true; this.note = null; this.doneNote = null; this.opLabel = label;
+    cx.spawn(async (cx) => {
+      const opts = { cwd: root, on, timeout: 300000 };
+      try {
+        let out = "";
+        if (op.kind === "git") {
+          for (const args of op.steps) {
+            const r = await exec("env", [...QUIET, "git", ...args], opts);
+            if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout, 4) || `git ${args[0]} failed (exit ${r.code})`);
+            out = `${r.stdout}\n${r.stderr}`;
+          }
+        } else if (op.kind === "sh") {
+          const r = await exec("env", [...QUIET, "sh", "-c", op.script, "sh", ...(op.args ?? [])], opts);
+          if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout, 4) || `exit ${r.code}`);
+          out = `${r.stdout}\n${r.stderr}`;
+        } else if (op.kind === "undo") {
+          // As VS Code: the commit goes, its changes stay staged and its message comes back.
+          const msg = await exec("git", ["log", "-1", "--format=%B"], opts);
+          if (msg.code !== 0) throw new Error("There is no commit to undo");
+          const parent = await exec("git", ["rev-parse", "-q", "--verify", "HEAD~1"], opts);
+          const r = parent.code === 0 ? await exec("git", ["reset", "--soft", "HEAD~1"], opts) : await exec("git", ["update-ref", "-d", "HEAD"], opts);
+          if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout, 4));
+          const text = msg.stdout.trim();
+          if (text && !this.message.trim()) { this.message = text.split("\n")[0]; this.input.set_value(this.message); }
+          out = "Last commit undone: its changes are staged";
+        } else if (op.kind === "clone") {
+          // Here: a folder picked for it; on another machine: next to this repo.
+          const into = on ? root.replace(/\/[^/]+\/?$/, "") || "/" : await pickFolder({ prompt: "Clone into" });
+          if (!into) { out = "Clone cancelled"; return; }
+          const name = op.url.replace(/[/:]+$/, "").split(/[/:]/).pop().replace(/\.git$/, "") || "repo";
+          this.opLabel = `Cloning ${name}`; cx.notify();
+          const r = await exec("env", [...QUIET, "git", "clone", "--", op.url, name], { cwd: into, on, timeout: 600000 });
+          if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout, 4));
+          run("space.new", { folder: `${into.replace(/\/$/, "")}/${name}`, machine: on ?? "" });
+          out = `Cloned into ${tilde(`${into.replace(/\/$/, "")}/${name}`)}`;
+        }
+        this.done(op.kind === "git" || op.kind === "sh" ? `${label}: ${tail(out, 1) || "done"}` : out, cx);
+      } catch (e) { this.note = `${label} failed: ${e?.message ?? e}`; }
+      finally { this.busy = false; this.opLabel = null; this.refresh(cx); cx.notify(); }
     });
     cx.notify();
   }
@@ -1448,6 +1554,9 @@ export default class Changes extends View {
   render(cx) {
     this.trackSessions(cx);
     if (this.key() !== this.context) this.refresh(cx);
+    const op = shared(GITOP);
+    // Run after this render: cx.notify() isn't allowed while rendering (toggles call it).
+    if (op?.seq && op.seq !== this.opSeq) { this.opSeq = op.seq; if (op.owner === this.uid) cx.spawn(async (cx) => this.menuOp(op, cx)); }
     const t = theme(), session = this.mode === "session" ? this.session() : null;
     // The runtime ignores toLocaleTimeString's options (it adds seconds): hours and minutes by hand.
     const at = session?.at ? new Date(session.at) : null;
@@ -1470,7 +1579,7 @@ export default class Changes extends View {
         if (many && !g.items.length) continue;
         rows.push({ group: g });
         if (this.groupFolded(g)) continue;
-        const items = this.tree ? treeRows(buildTree(g.items), this.collapsed, g.id) : g.items.map((file) => ({ file, depth: 0 }));
+        const items = this.tree ? treeRows(buildTree(g.items), this.collapsed, g.id) : [...g.items].sort(SORTS[this.sort] ?? SORTS.path).map((file) => ({ file, depth: 0 }));
         for (const row of items) rows.push({ ...row, in: g });
       }
     }
@@ -1512,7 +1621,12 @@ export default class Changes extends View {
         .when(!this.searching && Boolean(this.root), (e) => e.child(this.iconButton("graph", "graph", () =>
           openOverlay({ mod: "git-graph", kind: "dialog", width: 0.94, height: 0.92, props: { root: this.root, on: active?.on ?? null } }), t)
           .tooltip(many ? `History of ${active?.name}` : "History")))
-        .child(this.iconButton("refresh", "refresh", (cx) => this.searching ? this.search(cx) : this.refresh(cx), t));
+        .child(this.iconButton("refresh", "refresh", (cx) => this.searching ? this.search(cx) : this.refresh(cx), t))
+        // More git, as VS Code's ⋯: pull, push, branches, stashes... (mods/git-menu).
+        .when(!this.searching, (e) => e.child(this.iconButton("more", "more", () =>
+          openOverlay({ mod: "git-menu", kind: "popup", at: "pointer", width: 270, height: 560,
+            props: { root: this.root, on: active?.on ?? null, owner: this.uid, tree: this.tree, mode: this.mode, sort: this.sort, preview: this.preview } }), t)
+          .tooltip(many ? `More actions for ${active?.name}` : "More actions")));
     if (this.searching) return root.child(header).child(this.searchBody(t));
     return root.child(header)
       // Which pane the panel follows: with several terminals or agents in a tab, the focused one.
@@ -1530,7 +1644,7 @@ export default class Changes extends View {
       .child(h_flex().id("commit").mx(10).mt(8).h(30).flex_none().gap(6).items_center().justify_center().rounded(6).text_size(13)
         .bg(canCommit ? t.solid : t.raised).text_color(canCommit ? t.solid_foreground : t.dim).when(canCommit, (e) => e.cursor_pointer())
         .on_click((_e, cx) => this.commit(cx))
-        .child(icon("check", 16)).child(div().min_w(0).truncate().child(this.busy ? "Working…" : this.generating ? "Waiting for message…" : many ? `Commit to ${active?.name}` : "Commit")))
+        .child(icon("check", 16)).child(div().min_w(0).truncate().child(this.busy ? `${this.opLabel ?? "Working"}…` : this.generating ? "Waiting for message…" : many ? `Commit to ${active?.name}` : "Commit")))
       .when(total > 0, (el) => el.child(div().px(14).pt(4).text_size(11).text_color(t.dim)
         .child([staged ? `${staged} staged${many ? ` in ${active?.name}` : ""}${this.group("outside").length ? ` · ${this.group("outside").length} from outside this session` : ""}` : `Nothing staged${many ? ` in ${active?.name}` : ""} · stage files with +`,
           ...stagedElsewhere.map(([r, n]) => `${n} staged in ${r.name}`)].join(" · "))))
@@ -1592,6 +1706,7 @@ export default class Changes extends View {
         .rounded(6).border_1().border_color(t.border).text_size(12).text_color(t.muted).cursor_pointer()
         .hover((s) => s.bg(t.hover).text_color(t.foreground)).on_click((_e, cx) => this.setPreview(true, cx))
         .child(svg("mods/diff-view/split.svg").size(14)).child("Show diff preview")))
+      .when(Boolean(this.doneNote) && !this.note, (e) => e.child(div().px(10).py(8).text_size(11).text_color(t.ansi2).child(this.doneNote)))
       .when(Boolean(this.note), (e) => e.child(div().px(10).py(8).text_size(11).text_color(t.ansi1).child(this.note)));
   }
 }
