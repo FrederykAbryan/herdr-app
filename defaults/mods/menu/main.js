@@ -90,8 +90,11 @@ function items(p, git) {
     case "space": {
       const gs = groups();
       const mine = gs.find((g) => (g.spaces ?? []).includes(tg.id));
+      const space = spaces().find((s) => s.id === tg.id);
+      const path = space && place(space);
       return [
         ["Rename", "space.rename", { id: tg.id }],
+        ...(path ? [["Copy path", "space.copy_path", { path }]] : []),
         ...(git ? [["New worktree", "worktree", { space: tg.id, action: "new" }], ["Open worktree", "worktree", { space: tg.id, action: "open" }]] : []),
         ...(git === "linked" ? [["Remove worktree", "worktree", { space: tg.id, action: "remove" }]] : []),
         ...gs.filter((g) => g !== mine).map((g) => [`Move to ${g.name}`, "group.move", { space: tg.id, group: g.id }]),
@@ -129,6 +132,7 @@ function items(p, git) {
 function menuIcon(command, args) {
   if (command.startsWith("group.")) return `mods/workspace-chrome/${{ move: "folder", leave: "minus", new: "folder-plus", rename: "square-pen", delete: "x" }[command.slice(6)]}.svg`;
   if (command === "space.pick") return "mods/workspace-chrome/folder.svg";
+  if (command === "space.copy_path") return "mods/workspace-chrome/files.svg";
   const name = command.endsWith(".close") ? "x" : command.endsWith(".rename") ? "square-pen" : command.endsWith(".new") ? "plus" : command === "worktree" ? "git-branch" : command === "app.help" ? "terminal" : command === "app.theme" ? "settings" : command === "pane.split" ? (args?.direction === "down" ? "panel-bottom" : "panel-right") : command === "pane.zoom" ? "square" : "terminal";
   return `mods/workspace-chrome/${name}.svg`;
 }
@@ -178,6 +182,7 @@ export default class Menu extends View {
     else if (it[1] === "group.delete") setShared(GROUPS, groups().filter((g) => g.id !== a.group));
     // Closing this popup would cancel a picker it awaits: the sidebar opens it (PICK).
     else if (it[1] === "space.pick") setShared(PICK, Date.now());
+    else if (it[1] === "space.copy_path") cx.write_to_clipboard(a.path);
     else if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
     else run(it[1], it[2]);
   }
