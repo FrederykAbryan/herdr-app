@@ -841,7 +841,7 @@ export default class Changes extends View {
         }
         // The repo of the focused folder first, then the rest by name.
         list.sort((a, b) => (b.root === here) - (a.root === here) || (b.primary ? 1 : 0) - (a.primary ? 1 : 0) || a.root.split("/").pop().localeCompare(b.root.split("/").pop()));
-        const repos = [];
+        let repos = [];
         for (const r of list) {
           try { repos.push(await this.scan(r.root, session?.on ?? on, this.mode === "session" ? r : null, session)); }
           catch (e) {
@@ -850,12 +850,21 @@ export default class Changes extends View {
             repos.push({ root: r.root, on: session?.on ?? on, name: r.root.split("/").pop(), groups: [], error: String(e?.message ?? e) }); }
           if (this.key() !== context) return;
         }
+        // Session: a repo where this session did nothing (no change, nothing staged or committed
+        // by it) is left out; what's staged there by someone else isn't this session's work.
+        // With none left, the first stays, so the panel keeps its repo and says nothing changed.
+        const scanned = repos;
+        if (this.mode === "session") {
+          const worked = repos.filter((r) => r.error || r.groups.some((g) => g.kind !== "outside" && g.items.length));
+          repos = worked.length ? worked : repos.slice(0, 1);
+        }
         this.repos = repos; this.groups = repos.flatMap((r) => r.groups); this.error = error;
         this.limited = repos.some((r) => r.limited);
         if (this.active && !repos.some((r) => r.root === this.active)) this.active = null;
         // With nothing picked, Commit goes where something is staged.
         if (!this.active) this.active = (repos.find((r) => r.groups.some((g) => (g.kind === "staged" || g.kind === "outside") && g.items.length)) ?? repos[0])?.root ?? null;
-        this.watch(repos.map((r) => r.root), session?.on ?? on, cx);
+        // Hidden repos are still watched, so one shows up as soon as the session changes it.
+        this.watch(scanned.map((r) => r.root), session?.on ?? on, cx);
         if (this.open && !this.item(this.open).item) { this.open = null; this.setLines([]); }
         // The first file's diff shows until you pick another.
         const first = this.groups.find((g) => g.items.length);
