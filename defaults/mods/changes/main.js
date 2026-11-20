@@ -408,6 +408,9 @@ const GITOP = "changes.gitop";
 // Network git never waits for a password nobody can type.
 const QUIET = ["GIT_TERMINAL_PROMPT=0", "GIT_MERGE_AUTOEDIT=no", "GIT_EDITOR=true"];
 const STATUS_ORDER = { C: 0, U: 1, A: 2, M: 3, D: 4 };
+// The diff follows the font_size setting; it was laid out for 12.5px text: 22px rows, 7.6px characters.
+const diffSize = () => settings().font_size ?? 12.5;
+const rowHeight = (size) => Math.ceil(size * 1.76), charWidth = (size) => size * 0.608;
 const SORTS = {
   name: (a, b) => a.path.split("/").pop().localeCompare(b.path.split("/").pop()) || a.path.localeCompare(b.path),
   path: (a, b) => a.path.localeCompare(b.path),
@@ -468,7 +471,7 @@ const GROUP_TITLE = { staged: "Staged Changes", outside: "Staged outside this se
 
 export default class Changes extends View {
   init(_props, cx) {
-    this.groups = []; this.rows = []; this.diffWidth = 0; this.message = ""; this.handle = cx.focus_handle();
+    this.groups = []; this.rows = []; this.longest = 0; this.message = ""; this.handle = cx.focus_handle();
     this.pending = new Set(); this.queue = {}; this.collapsed = new Set(); this.folded = new Set(); this.foldedRepos = new Set();
     this.repos = []; this.active = null; this.watched = new Set(); this.watchGen = 0;
     try { this.mode = localStorage.getItem("mode") === "all" ? "all" : "session"; } catch { this.mode = "session"; }
@@ -1026,7 +1029,7 @@ export default class Changes extends View {
     // (a JSDoc " * " line, a continuation) say nothing about the step.
     const leads = this.rows.filter((r) => r.kind && r.kind !== "@" && r.text.trim()).map((r) => /^ */.exec(r.text)[0].length).filter((n) => n >= 2 && n % 2 === 0);
     this.indent = leads.some((n) => n % 4 === 2) ? 2 : 4;
-    this.diffWidth = Math.max(300, ...this.rows.map(row => (row.text.length + 1) * 7.6 + 70));
+    this.longest = Math.max(0, ...this.rows.map(row => row.text.length + 1));
   }
 
   endResize(cx) {
@@ -1474,9 +1477,9 @@ export default class Changes extends View {
 
   // The compare view's terminal look (mods/diff-view): solid rows, GitHub's dark syntax colors.
   // A light appearance keeps the theme's colors.
-  diffRow(row, t) {
-    const { kind, number } = row;
-    if (kind === "@") return div().w_full().px(12).h(22).flex_none().flex().items_center().truncate().bg(t.accent + "1f").text_color(t.accent).child(row.text);
+  diffRow(row, t, size = diffSize()) {
+    const { kind, number } = row, height = rowHeight(size);
+    if (kind === "@") return div().w_full().px(12).h(height).flex_none().flex().items_center().truncate().bg(t.accent + "1f").text_color(t.accent).child(row.text);
     const v = settings().dark === false ? {
       syntax: { keyword: t.ansi12, control: t.ansi12, literal: t.ansi13, function: t.ansi11, type: t.ansi14, tag: t.ansi14, string: t.ansi3,
         number: t.ansi13, attr: t.ansi10, bracket: t.ansi13, comment: t.dim, punct: t.muted },
@@ -1492,8 +1495,8 @@ export default class Changes extends View {
         return div().flex_none().text_color(v.syntax[k] ?? v.text).when(k === "comment" || k === "attr", (e) => e.italic())
           .when(Boolean(tk.hl && word), (e) => e.bg(word)).child(tk.text);
       }));
-    return h_flex().w_full().h(22).flex_none().items_center().when(Boolean(bg), (e) => e.bg(bg))
-      .child(div().w(40).h_full().flex_none().pr(4).flex().items_center().justify_end().text_color(bg ? v.changedNumber : v.number)
+    return h_flex().w_full().h(height).flex_none().items_center().when(Boolean(bg), (e) => e.bg(bg))
+      .child(div().w(Math.max(40, Math.ceil(5 * charWidth(size)) + 4)).h_full().flex_none().pr(4).flex().items_center().justify_end().text_color(bg ? v.changedNumber : v.number)
         .child(number === undefined ? "" : String(number)))
       .child(div().w(16).flex_none().text_color(kind === "+" ? v.addSign : kind === "-" ? v.delSign : v.number).child(kind === "+" ? "+" : kind === "-" ? "-" : ""))
       .child(body);
@@ -1787,10 +1790,10 @@ export default class Changes extends View {
             .hover((s) => s.bg(t.hover).text_color(t.foreground))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation()).on_click((_e, cx) => this.setPreview(false, cx))
             .child(svg("mods/diff-view/close.svg").size(14))))
-        .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(12.5)
+        .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(diffSize())
           .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
-            .child(div().w_full().min_w(this.diffWidth).h_full().child(v_virtual_list("changes-diff", this.rows.length, 22, (i) => String(i),
-              (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full())))
+            .child(div().w_full().min_w(Math.max(300, this.longest * charWidth(diffSize()) + 70)).h_full().child(v_virtual_list("changes-diff", this.rows.length, rowHeight(diffSize()), (i) => String(i),
+              (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t, diffSize()))).size_full())))
           .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())))
       // With the preview put away the list fills the panel; this bar brings the preview back.
       .when(!this.preview, (e) => e.child(h_flex().id("preview-show").mx(10).mb(10).mt(6).h(30).flex_none().gap(6).items_center().justify_center()

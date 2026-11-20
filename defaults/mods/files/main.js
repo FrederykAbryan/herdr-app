@@ -222,7 +222,7 @@ export default class Files extends View {
 
   editor(path, value, readonly) {
     const code = EditorState.new({ language: langOf(path), readonly, value,
-      font_family: settings().font_family, font_size: 12, syntax: syntaxFor(theme()) });
+      font_family: settings().font_family, font_size: settings().font_size, syntax: syntaxFor(theme()) });
     if (!readonly) code.on("change", (_e, cx) => { this.leaving = false; if (!this.conflict) this.editNote = null; cx.notify(); });
     return code;
   }
