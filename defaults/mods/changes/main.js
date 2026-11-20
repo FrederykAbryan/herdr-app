@@ -864,20 +864,28 @@ export default class Changes extends View {
   get hasHead() { return this.repo()?.hasHead ?? false; }
   setActive(root, cx) { if (this.active !== root) { this.active = root; cx?.notify(); } }
 
+  // One visit to a folder (and mode, session): results from an earlier visit, even to the
+  // same folder, are stale too.
+  current(context) {
+    return this.context === context && this.key() === context.key;
+  }
+
   refresh(cx) {
-    if (this.loading || this.busy) return;
-    const { cwd, on } = location(), context = this.key();
-    if (context !== this.context) {
-      this.context = context; this.repos = []; this.groups = []; this.open = null; this.watched = new Set(); this.watchGen = (this.watchGen ?? 0) + 1;
+    const { cwd, on } = location(), next = this.key();
+    if (next !== this.context?.key) {
+      this.context = { key: next }; this.repos = []; this.groups = []; this.open = null; this.watched = new Set(); this.watchGen = (this.watchGen ?? 0) + 1;
       this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.closed = false; this.limited = false; this.confirming = null;
+      this.loading = false;
     }
-    const session = this.session();
+    // A load left behind in another folder (a slow git, a preview that never ends) must not hold this one.
+    if (this.loading || this.busy) return;
+    const context = this.context, session = this.session();
     if (!cwd && !session) return;
     this.loading = true;
     cx.spawn(async (cx) => {
       try {
         const top = cwd ? await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on }) : null;
-        if (this.key() !== context) return;
+        if (!this.current(context)) return;
         const here = top?.code === 0 ? top.stdout.trim() : null, mine = session ? sessionRoots(session) : [];
         let list = [], error = null;
         if (this.mode === "session") {
@@ -899,7 +907,7 @@ export default class Changes extends View {
             // A repo folder that's gone (a removed worktree, a deleted scratch repo) just drops out.
             if ((await exec("test", ["-d", r.root], { on: session?.on ?? on }).catch(() => ({ code: 0 }))).code !== 0) continue;
             repos.push({ root: r.root, on: session?.on ?? on, name: r.root.split("/").pop(), groups: [], error: String(e?.message ?? e) }); }
-          if (this.key() !== context) return;
+          if (!this.current(context)) return;
         }
         // Session: a repo where this session did nothing (no change, nothing staged or committed
         // by it) is left out; what's staged there by someone else isn't this session's work.
@@ -923,10 +931,10 @@ export default class Changes extends View {
         if (!first) this.setLines([]);
         if (this.open) {
           try { await this.load(this.open, context); }
-          catch { if (this.key() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
+          catch { if (this.current(context)) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
         }
-      } catch (e) { if (this.key() === context) this.error = String(e); }
-      finally { this.loading = false; cx.notify(); }
+      } catch (e) { if (this.current(context)) this.error = String(e); }
+      finally { if (this.context === context) this.loading = false; cx.notify(); }
     });
   }
 
@@ -1019,8 +1027,8 @@ export default class Changes extends View {
         lines = [`@@ -0,0 +1,${item.add} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map(l => `+${l}`)];
       }
     } else lines = await diff([]);
-    if (this.key() === context && this.open === key) this.lang = lang;
-    if (this.key() === context && this.open === key) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
+    if (this.current(context) && this.open === key) this.lang = lang;
+    if (this.current(context) && this.open === key) this.setLines(lines.slice(0, 1500).map(line => line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line));
   }
 
   setLines(lines) {
@@ -1056,7 +1064,7 @@ export default class Changes extends View {
     const context = this.context;
     if (this.open) cx.spawn(async (cx) => {
       try { await this.load(key, context); }
-      catch (e) { if (this.key() === context && this.open === key) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
+      catch (e) { if (this.current(context) && this.open === key) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
       cx.notify();
     });
     cx.notify();
@@ -1156,7 +1164,7 @@ export default class Changes extends View {
   commit(cx, opts = {}) {
     const repo = this.repo();
     const amend = Boolean(opts.amend);
-    if (!repo || this.busy || this.loading || this.generating || this.context !== this.key()) return;
+    if (!repo || this.busy || this.loading || this.generating || this.context?.key !== this.key()) return;
     if (!this.message.trim() && !amend) { if (opts.menu) this.warn("Can't commit", "Type a commit message first", cx); return; }
     const staged = this.group("staged", repo), outside = this.group("outside", repo);
     const all = Boolean(opts.all || (opts.smart && !staged.length && !outside.length));
@@ -1186,7 +1194,7 @@ export default class Changes extends View {
           const now = (shared(SESSIONS) ?? {})[session.address] ?? record(session);
           this.saveSession(session.address, withRoot(now, root, { tree }));
         }
-      } catch (e) { this.fail(amend ? "Amend failed" : "Commit failed", e, this.key() === context); }
+      } catch (e) { this.fail(amend ? "Amend failed" : "Commit failed", e, this.current(context)); }
       finally { this.busy = false; this.opLabel = null; this.refresh(cx); cx.notify(); }
     });
     cx.notify();
@@ -1316,13 +1324,13 @@ export default class Changes extends View {
         if (seq !== this.genSeq) return;
         const line = r.stdout.split("\n").map((l) => l.trim().replace(/^["'`]+|["'`]+$/g, "").trim()).filter(Boolean).pop();
         if (r.code !== 0 || !line) throw new Error(r.stderr.trim().split("\n").filter(Boolean).pop() || `exit code ${r.code}`);
-        if (this.key() === context) {
+        if (this.current(context)) {
           this.message = line; this.input.set_value(line); this.input.focus();
           // A short green border says the message is in.
           this.genDone = true;
           cx.timer.after(1500, (cx) => { if (seq === this.genSeq) { this.genDone = false; cx.notify(); } });
         }
-      } catch (e) { if (seq === this.genSeq && this.key() === context) this.note = `Could not write a message: ${e?.message ?? e}`; }
+      } catch (e) { if (seq === this.genSeq && this.current(context)) this.note = `Could not write a message: ${e?.message ?? e}`; }
       finally { if (seq === this.genSeq) { this.generating = false; cx.notify(); } }
     });
     cx.notify();
@@ -1647,7 +1655,7 @@ export default class Changes extends View {
 
   render(cx) {
     this.trackSessions(cx);
-    if (this.key() !== this.context) this.refresh(cx);
+    if (this.key() !== this.context?.key) this.refresh(cx);
     const op = shared(GITOP);
     // Run after this render: cx.notify() isn't allowed while rendering (toggles call it).
     if (op?.seq && op.seq !== this.opSeq) { this.opSeq = op.seq; if (op.owner === this.uid) cx.spawn(async (cx) => this.menuOp(op, cx)); }
