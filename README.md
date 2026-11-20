@@ -7,7 +7,7 @@
 >
 > Upstream accepts only fixes for its shipped panels ([CONTRIBUTING.md](CONTRIBUTING.md)), so these features live here as personal mods instead of a pull request.
 
-This fork changes only the JavaScript panels (mods) in `defaults/mods/`. The app itself (`src/`, `crates/`) is untouched, so the panels install into a regular released Herdr without building anything.
+This fork changes the JavaScript panels (mods) in `defaults/mods/` and adds a few helper scripts. The app's own code (`src/`, `crates/`) is untouched, so everything installs into a regular released Herdr without building the app.
 
 ## What this fork adds
 
@@ -48,6 +48,11 @@ This fork changes only the JavaScript panels (mods) in `defaults/mods/`. The app
 - Ungrouped spaces come first, then each group with a count. Worktree spaces stay with their checkout. In the narrow sidebar rail, a group is a thin line that folds it when clicked.
 - Groups only change how the list is shown: they're saved in the shared key `spaces.groups`, and the order of spaces stays Herdr's.
 
+**GNOME dock — no gear icon at launch** (Linux, Wayland; new `scripts/appid-shim`)
+- A released Herdr names its window about 70 ms after opening it. Until then GNOME can't match the window to `herdr-app.desktop`, so the dock shows a generic gear icon for a moment.
+- `herdr-appid-shim.c` is a tiny `LD_PRELOAD` library that names the window the moment it is created. It touches nothing else and drops itself from the environment once the window opens, so herdr-core, your shells and your agents don't inherit it.
+- The install script builds it into `~/.local/lib/herdr-appid-shim/` and points the launcher's `Exec=` line in `herdr-app.desktop` at it. Opening Herdr from the dock or app grid uses it, but running `herdr-app` in a terminal doesn't. To undo it, set the line back to `Exec=$HOME/.local/bin/herdr-app` (with your home written out in full).
+
 ## Install the panels into Herdr
 
 You need [Herdr](#install) installed and running. Then:
@@ -59,12 +64,13 @@ git switch feat/changes-session-focus   # the default branch of this fork
 sh scripts/install-fork-mods.sh
 ```
 
-The script installs everything as **personal copies**: `changes-focus`, `agents-view`, `tabs-plus`, `pane-grid`, `diff-view`, `git-graph`, `workspace-status-plus`, `spaces-plus` and `menu-plus`, plus a layout `main-focus` that uses them, and switches to that layout. Herdr's own panels and your existing layout stay as they were. **Ctrl+Shift+L** switches layouts, and deleting those folders in `~/.config/herdr-app` removes the fork's panels. App updates never overwrite personal copies, but they also don't bring upstream fixes into them. Re-run the script after pulling this fork.
+The script installs everything as **personal copies**: `changes-focus`, `agents-view`, `tabs-plus`, `pane-grid`, `diff-view`, `git-graph`, `workspace-status-plus`, `spaces-plus` and `menu-plus`, plus a layout `main-focus` that uses them, and switches to that layout. Herdr's own panels and your existing layout stay as they were. **Ctrl+Shift+L** switches layouts, and deleting those folders in `~/.config/herdr-app` removes the fork's panels. App updates never overwrite personal copies, but they also don't bring upstream fixes into them. Re-run the script after pulling this fork. On Linux it also installs the [app-id shim](#what-this-fork-adds). A Herdr update rewrites `herdr-app.desktop`, which brings the gear icon back, so re-run the script after updating Herdr too.
 
 **Requirements and limits:**
 - Session focus and Generate need `git`, and on remote machines `env`, `cp` and `/tmp` (Linux, macOS, Unix servers; not Windows).
 - Generate needs Claude Code installed and signed in.
 - The syntax highlighter is a small one-line-at-a-time highlighter, not a full parser.
+- The app-id shim needs a C compiler (`cc`) and the Wayland client headers (`wayland-devel` on Fedora, `libwayland-dev` on Debian/Ubuntu). Without them the script skips it.
 
 ## License and credits
 
