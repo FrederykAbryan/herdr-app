@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, agents, terminals, machines, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay, home, run, pickFolder } from "herdr";
+import { spaces, panes, focused, agents, terminals, machines, exec, readTextFile, watchFolder, theme, settings, shared, setShared, openOverlay, home, run, pickFolder, notify } from "herdr";
 import { typeIcon, folderIcon } from "./filetypes.js";
 
 function location() {
@@ -415,6 +415,54 @@ const SORTS = {
 };
 // What git said last, for a short note: its last few lines.
 const tail = (text, n = 3) => text.trim().split("\n").map((l) => l.trim()).filter(Boolean).slice(-n).join(" · ");
+
+// A failed git run as an Error: a short message for the panel's note (git's error:/fatal:/
+// CONFLICT lines when it printed any, else its last lines) and everything it printed, stdout
+// and stderr, for the error dialog. Pull and merge print CONFLICT on stdout and only
+// "From <remote>" on stderr, so neither stream alone says what went wrong.
+function gitError(r, command, fallback) {
+  const detail = [r.stdout, r.stderr].map((s) => (s ?? "").trim()).filter(Boolean).join("\n");
+  const key = detail.split("\n").map((l) => l.trim()).filter((l) => /^(error|fatal|CONFLICT|! \[)/.test(l));
+  const e = new Error((key.length ? key.slice(0, 3).join(" · ") : tail(detail, 4)) || fallback || `${command} failed (exit ${r.code})`);
+  e.detail = detail || `${command} exited with code ${r.code} and printed nothing.`;
+  e.command = command;
+  return e;
+}
+
+// A successful run in one line: its last line (git ends with the useful one: "Already up to
+// date.", "main -> main", "Everything up-to-date").
+const summary = (out) => tail(out ?? "", 1) || "done";
+
+// What to do next, in plain words, for the git errors people meet most.
+function gitHint(text) {
+  const s = text ?? "";
+  if (/\[rejected\].*\((fetch first|non-fast-forward)\)|Updates were rejected because the (remote|tip)/.test(s))
+    return "The remote has commits you don't have yet. Pull first (⋯ › Pull, Push › Pull, or Pull (Rebase)), fix any conflicts, then Push again. Use Push (Force with Lease) only if you mean to throw the remote's commits away.";
+  if (/\[rejected\].*\(stale info\)|stale info/.test(s))
+    return "Someone pushed since your last fetch, so the force push was refused. Fetch, look at what they pushed, then decide.";
+  if (/CONFLICT|Automatic merge failed|fix conflicts|Resolve all conflicts manually|could not apply/.test(s))
+    return "There are merge conflicts. Open the files marked C in Changes, keep the parts you want and remove the <<<<<<< ======= >>>>>>> markers, stage them with +, then Commit. To back out instead: Commit › Abort Rebase (for a rebase) or run git merge --abort (for a merge).";
+  if (/divergent branches|Need to specify how to reconcile/.test(s))
+    return "Your branch and the remote both have new commits. Use Pull, Push › Pull (Rebase) to put yours on top, or set git config pull.rebase false to merge.";
+  if (/would be overwritten by (merge|checkout)|Please commit your changes or stash them/.test(s))
+    return "You have uncommitted changes in files this would overwrite. Commit them, or Stash them (⋯ › Stash), then try again.";
+  if (/You have unstaged changes|cannot (pull|rebase) with rebase: You have unstaged changes/.test(s))
+    return "Rebase needs a clean working tree. Commit or Stash your changes first.";
+  if (/has no upstream branch|no tracking information/.test(s))
+    return "This branch isn't linked to a remote branch yet. Use Branch › Publish Branch…, or Pull, Push › Push to…";
+  if (/rebase in progress|You are currently rebasing|middle of a (rebase|merge)|MERGE_HEAD exists|unfinished merge/.test(s))
+    return "A merge or rebase is still in progress. Finish it (resolve, stage, commit) or abort it (Commit › Abort Rebase, or git merge --abort).";
+  if (/Authentication failed|could not read Username|terminal prompts disabled|Permission denied \(publickey\)|403|Invalid username or password/.test(s))
+    return "Git couldn't log in to the remote. Check your SSH key (ssh -T git@github.com) or credential helper / token, e.g. gh auth login, then try again.";
+  if (/Could not resolve host|Connection timed out|Connection refused|unable to access/.test(s))
+    return "The remote couldn't be reached. Check your network or VPN, and the remote URL (Remote menu).";
+  if (/does not appear to be a git repository|No configured push destination|No such remote/.test(s))
+    return "There's no usable remote. Add one with Remote › Add Remote…";
+  if (/not fully merged/.test(s))
+    return "That branch has commits that aren't merged anywhere. Use Delete Branch (Force) if you really want them gone.";
+  if (/already exists/.test(s)) return "Something with that name already exists. Pick another name.";
+  return null;
+}
 
 const GROUP_TITLE = { staged: "Staged Changes", outside: "Staged outside this session", changes: "Changes", committed: "Committed by this session" };
 
@@ -1051,8 +1099,8 @@ export default class Changes extends View {
     cx.spawn(async (cx) => {
       try {
         const r = await exec("git", ["--literal-pathspecs", ...args], { cwd: root, on });
-        if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
-      } catch (e) { this.note = String(e?.message ?? e); }
+        if (r.code !== 0) throw gitError(r, `git ${args.join(" ")}`);
+      } catch (e) { this.fail(args[0] === "add" ? "Stage failed" : "Unstage failed", e); }
       finally { this.busy = false; this.refresh(cx); cx.notify(); }
     });
     cx.notify();
@@ -1083,12 +1131,16 @@ export default class Changes extends View {
       try {
         const git = async (args) => {
           const r = await exec("git", ["--literal-pathspecs", ...args], { cwd: root, on });
-          if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
+          if (r.code !== 0) throw gitError(r, `git ${args.slice(0, 2).join(" ")} …`);
         };
         if (tracked.length) await git(["restore", "--worktree", "--", ...tracked]);
         if (fresh.length) await git(["clean", "-f", "-q", "--", ...fresh]);
-        if (conflicts.length) this.note = `Not discarded (merge conflict, resolve first): ${conflicts.slice(0, 3).join(", ")}${conflicts.length > 3 ? ` +${conflicts.length - 3}` : ""}`;
-      } catch (e) { this.note = `Discard failed: ${e?.message ?? e}`; }
+        const done = tracked.length + fresh.length;
+        if (conflicts.length) {
+          this.note = `Not discarded (merge conflict, resolve first): ${conflicts.slice(0, 3).join(", ")}${conflicts.length > 3 ? ` +${conflicts.length - 3}` : ""}`;
+          notify({ title: "Some files were not discarded", body: `${conflicts.length} file${conflicts.length === 1 ? " has" : "s have"} a merge conflict: resolve first`, level: "warning" });
+        } else if (done) notify({ title: "Changes discarded", body: `${done} file${done === 1 ? "" : "s"}`, level: "success" });
+      } catch (e) { this.fail("Discard failed", e); }
       finally { this.busy = false; this.refresh(cx); cx.notify(); }
     });
     cx.notify();
@@ -1102,15 +1154,15 @@ export default class Changes extends View {
     const repo = this.repo();
     const amend = Boolean(opts.amend);
     if (!repo || this.busy || this.loading || this.generating || this.context !== this.key()) return;
-    if (!this.message.trim() && !amend) { if (opts.menu) { this.note = "Type a commit message first"; cx.notify(); } return; }
+    if (!this.message.trim() && !amend) { if (opts.menu) this.warn("Can't commit", "Type a commit message first", cx); return; }
     const staged = this.group("staged", repo), outside = this.group("outside", repo);
     const all = Boolean(opts.all || (opts.smart && !staged.length && !outside.length));
     const extra = all ? this.group("changes", repo).filter((f) => f.status !== "C") : [];
-    if (!staged.length && !outside.length && !extra.length && !amend) { this.note = all ? "No changes to commit" : "Nothing is staged: stage files with + first"; cx.notify(); return; }
+    if (!staged.length && !outside.length && !extra.length && !amend) { this.warn("Can't commit", all ? "No changes to commit" : "Nothing is staged: stage files with + first", cx); return; }
     const reverted = [...staged, ...outside].filter((f) => f.reverted).map((f) => f.path);
     if (reverted.length) {
-      this.note = `Reverted but still staged: ${reverted.slice(0, 3).join(", ")}${reverted.length > 3 ? ` +${reverted.length - 3}` : ""}. Unstage (−) to drop the change, or stage (+) again to commit it.`;
-      cx.notify(); return;
+      this.warn("Can't commit", `Reverted but still staged: ${reverted.slice(0, 3).join(", ")}${reverted.length > 3 ? ` +${reverted.length - 3}` : ""}. Unstage (−) to drop the change, or stage (+) again to commit it.`, cx);
+      return;
     }
     const root = repo.root, on = repo.on, context = this.context, message = this.message.trim();
     const session = repo.trees ? repo.session : null, paths = [...staged, ...extra].map((f) => f.path);
@@ -1119,19 +1171,19 @@ export default class Changes extends View {
       try {
         if (extra.length) {
           const a = await exec("git", ["--literal-pathspecs", "add", "-A", "--", ...extra.map((f) => f.path)], { cwd: root, on });
-          if (a.code !== 0) throw new Error((a.stderr || a.stdout).trim());
+          if (a.code !== 0) throw gitError(a, "git add");
         }
         const args = ["commit", ...(message ? ["-m", message] : ["--no-edit"]), ...(amend ? ["--amend"] : []), ...(opts.signoff ? ["--signoff"] : [])];
         const r = await exec("env", [...QUIET, "git", ...args], { cwd: root, on });
-        if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
-        if (opts.menu) this.done(tail(r.stdout, 1), cx);
+        if (r.code !== 0) throw gitError(r, `git commit${amend ? " --amend" : ""}${opts.signoff ? " --signoff" : ""}`);
+        this.ok(amend ? "Commit amended" : "Committed", tail(r.stdout, 1) || message, cx);
         this.message = ""; this.input.set_value("");
         if (session && paths.length) {
           const tree = await this.advance(root, on, repo.trees.base, paths);
           const now = (shared(SESSIONS) ?? {})[session.address] ?? record(session);
           this.saveSession(session.address, withRoot(now, root, { tree }));
         }
-      } catch (e) { if (this.key() === context) this.note = `Commit failed: ${e?.message ?? e}`; }
+      } catch (e) { this.fail(amend ? "Amend failed" : "Commit failed", e, this.key() === context); }
       finally { this.busy = false; this.opLabel = null; this.refresh(cx); cx.notify(); }
     });
     cx.notify();
@@ -1142,6 +1194,31 @@ export default class Changes extends View {
     const seq = ++this.doneSeq;
     this.doneNote = text || "Done";
     cx.timer.after(6000, (cx) => { if (seq === this.doneSeq) { this.doneNote = null; cx.notify(); } });
+  }
+
+  // Success: the green line plus a toast, so it's seen even with the panel hidden.
+  ok(title, body, cx) {
+    this.done(body ? `${title}: ${body}` : title, cx);
+    notify({ title, body: body || "", level: "success" });
+  }
+
+  // Couldn't start (nothing staged, busy...): the red note plus a warning toast.
+  warn(title, text, cx) {
+    this.note = text;
+    notify({ title, body: text, level: "warning" });
+    cx?.notify();
+  }
+
+  // Failure: the short red note in the panel, and a dialog with everything git printed and
+  // what to do next. `show` false (the panel moved to another repo meanwhile) skips the note.
+  fail(title, e, show = true) {
+    const message = String(e?.message ?? e);
+    if (show) this.note = `${title}: ${message}`;
+    const detail = e?.detail ?? message;
+    openOverlay({
+      mod: "git-result", kind: "dialog", width: 620, height: 420,
+      props: { title, command: e?.command ?? null, hint: gitHint(detail), detail },
+    });
   }
 
   // The ⋯ menu's work (mods/git-menu): git commands, or what the panel's own buttons do.
@@ -1156,7 +1233,7 @@ export default class Changes extends View {
     if (op.kind === "commit") { this.commit(cx, { ...op, menu: true }); return; }
     if (op.kind === "stage-all" || op.kind === "discard-all") {
       const items = this.group("changes", repo).filter((f) => (op.tracked ? !f.fresh : op.untracked ? f.fresh : true));
-      if (!items.length) { this.note = "No changes"; cx.notify(); return; }
+      if (!items.length) { this.warn(op.kind === "stage-all" ? "Nothing to stage" : "Nothing to discard", "No changes", cx); return; }
       const paths = items.map((f) => f.path);
       if (op.kind === "stage-all") this.stage(repo, paths, cx);
       else this.discard(repo, paths, op.tracked ? "all tracked files" : op.untracked ? "all untracked files" : `all ${paths.length} file${paths.length === 1 ? "" : "s"}`, cx);
@@ -1164,13 +1241,14 @@ export default class Changes extends View {
     }
     if (op.kind === "unstage-all") {
       const paths = [...this.group("staged", repo), ...this.group("outside", repo)].map((f) => f.path);
-      if (!paths.length) { this.note = "Nothing is staged"; cx.notify(); return; }
+      if (!paths.length) { this.warn("Nothing to unstage", "Nothing is staged", cx); return; }
       this.unstage(repo, paths, cx);
       return;
     }
     const root = op.root ?? repo?.root, on = op.on ?? repo?.on ?? null;
-    if (!root || this.busy) { if (this.busy) { this.note = "Busy: try again in a moment"; cx.notify(); } return; }
     const label = op.label ?? "Git";
+    if (!root) { this.warn(`${label} didn't run`, "Not a git repository", cx); return; }
+    if (this.busy) { this.warn(`${label} didn't run`, `${this.opLabel ?? "Another git action"} is still running: try again in a moment`, cx); return; }
     this.busy = true; this.note = null; this.doneNote = null; this.opLabel = label;
     cx.spawn(async (cx) => {
       const opts = { cwd: root, on, timeout: 300000 };
@@ -1179,36 +1257,40 @@ export default class Changes extends View {
         if (op.kind === "git") {
           for (const args of op.steps) {
             const r = await exec("env", [...QUIET, "git", ...args], opts);
-            if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout, 4) || `git ${args[0]} failed (exit ${r.code})`);
+            if (r.code !== 0) throw gitError(r, `git ${args.join(" ")}`);
             out = `${r.stdout}\n${r.stderr}`;
           }
         } else if (op.kind === "sh") {
           const r = await exec("env", [...QUIET, "sh", "-c", op.script, "sh", ...(op.args ?? [])], opts);
-          if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout, 4) || `exit ${r.code}`);
+          if (r.code !== 0) throw gitError(r, label.toLowerCase() === "push" ? "git push" : label.toLowerCase() === "sync" ? "git pull && git push" : label);
           out = `${r.stdout}\n${r.stderr}`;
         } else if (op.kind === "undo") {
           // As VS Code: the commit goes, its changes stay staged and its message comes back.
           const msg = await exec("git", ["log", "-1", "--format=%B"], opts);
-          if (msg.code !== 0) throw new Error("There is no commit to undo");
+          if (msg.code !== 0) throw gitError(msg, "git log -1", "There is no commit to undo");
           const parent = await exec("git", ["rev-parse", "-q", "--verify", "HEAD~1"], opts);
           const r = parent.code === 0 ? await exec("git", ["reset", "--soft", "HEAD~1"], opts) : await exec("git", ["update-ref", "-d", "HEAD"], opts);
-          if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout, 4));
+          if (r.code !== 0) throw gitError(r, "git reset --soft HEAD~1");
           const text = msg.stdout.trim();
           if (text && !this.message.trim()) { this.message = text.split("\n")[0]; this.input.set_value(this.message); }
           out = "Last commit undone: its changes are staged";
         } else if (op.kind === "clone") {
           // Here: a folder picked for it; on another machine: next to this repo.
           const into = on ? root.replace(/\/[^/]+\/?$/, "") || "/" : await pickFolder({ prompt: "Clone into" });
-          if (!into) { out = "Clone cancelled"; return; }
+          if (!into) { notify({ title: "Clone cancelled", body: "", level: "info" }); return; }
           const name = op.url.replace(/[/:]+$/, "").split(/[/:]/).pop().replace(/\.git$/, "") || "repo";
           this.opLabel = `Cloning ${name}`; cx.notify();
           const r = await exec("env", [...QUIET, "git", "clone", "--", op.url, name], { cwd: into, on, timeout: 600000 });
-          if (r.code !== 0) throw new Error(tail(r.stderr || r.stdout, 4));
+          if (r.code !== 0) throw gitError(r, `git clone ${op.url}`);
           run("space.new", { folder: `${into.replace(/\/$/, "")}/${name}`, machine: on ?? "" });
           out = `Cloned into ${tilde(`${into.replace(/\/$/, "")}/${name}`)}`;
         }
-        this.done(op.kind === "git" || op.kind === "sh" ? `${label}: ${tail(out, 1) || "done"}` : out, cx);
-      } catch (e) { this.note = `${label} failed: ${e?.message ?? e}`; }
+        if (op.kind === "git" || op.kind === "sh") this.ok(`${label} succeeded`, summary(out), cx);
+        else this.ok(label === "Git" ? "Done" : `${label} done`, out, cx);
+      } catch (e) {
+        // exec itself rejects on a timeout or an unreachable machine: no git output then.
+        this.fail(`${label} failed`, e);
+      }
       finally { this.busy = false; this.opLabel = null; this.refresh(cx); cx.notify(); }
     });
     cx.notify();
